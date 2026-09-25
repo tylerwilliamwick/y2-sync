@@ -204,6 +204,48 @@ test(
   },
 );
 
+test(
+  "managed subprocess success cleans background descendants before returning",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const fixture = mkdtempSync(join(tmpdir(), "y2-managed-success-"));
+    const scriptPath = join(fixture, "background-child.mjs");
+    const pidPath = join(fixture, "pid.txt");
+    let descendantPid = null;
+    t.after(() => {
+      if (descendantPid) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+      }
+      rmSync(fixture, { recursive: true, force: true });
+    });
+    writeFileSync(
+      scriptPath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+        "child.unref();",
+        "writeFileSync(process.argv[2], String(child.pid));",
+      ].join("\n"),
+    );
+    assert.equal(
+      await runManagedSubprocess([
+        "10000",
+        process.execPath,
+        scriptPath,
+        pidPath,
+      ]),
+      0,
+    );
+    descendantPid = Number(readFileSync(pidPath, "utf8"));
+    assert.throws(() => process.kill(descendantPid, 0), /ESRCH/);
+  },
+);
+
 test("abandoned run cleanup is isolated by maintenance state directory", (t) => {
   const fixture = mkdtempSync(join(tmpdir(), "y2-maintenance-recovery-"));
   const firstRoot = maintenanceRunCacheRoot(join(fixture, "first-state"));

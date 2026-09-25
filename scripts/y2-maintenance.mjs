@@ -526,6 +526,7 @@ export function runManagedSubprocess(argv) {
       windowsHide: true,
     });
     let timedOut = false;
+    let terminationStarted = false;
     let settled = false;
     let childExited = false;
     let childCode = 1;
@@ -559,16 +560,14 @@ export function runManagedSubprocess(argv) {
     };
     const finishWhenStopped = () => {
       if (!childExited) return;
-      if (!timedOut) {
-        settle(resolvePromise, childCode);
-      } else if (!processGroupExists()) {
-        if (terminationError) settle(rejectPromise, terminationError);
-        else settle(resolvePromise, 124);
-      }
+      if (processGroupExists()) return;
+      if (terminationError) settle(rejectPromise, terminationError);
+      else settle(resolvePromise, timedOut ? 124 : childCode);
     };
-    const terminate = () => {
-      if (timedOut) return;
-      timedOut = true;
+    const terminate = (timeoutTriggered = true) => {
+      if (terminationStarted) return;
+      terminationStarted = true;
+      timedOut = timeoutTriggered;
       try {
         terminateManagedProcessTree(child.pid, "SIGTERM");
       } catch (error) {
@@ -599,7 +598,12 @@ export function runManagedSubprocess(argv) {
     child.once("exit", (code) => {
       childExited = true;
       childCode = Number.isInteger(code) ? code : 1;
-      finishWhenStopped();
+      try {
+        if (processGroupExists()) terminate(false);
+        finishWhenStopped();
+      } catch (error) {
+        settle(rejectPromise, error);
+      }
     });
     timeoutHandle = setTimeout(terminate, timeoutMs);
   });
