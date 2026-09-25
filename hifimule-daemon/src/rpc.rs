@@ -56,6 +56,7 @@ const SERVER_ICON_IDS: &[&str] = &[
     "headphones",
     "collection-play",
     "disc",
+    "folder-music",
     "broadcast-pin",
     "book",
 ];
@@ -512,6 +513,19 @@ async fn handler(
     let result = match payload.method.as_str() {
         "test_connection" => handle_test_connection(&state, payload.params).await,
         "server.connect" => handle_server_connect(&state, payload.params).await,
+        "library.local.add" => handle_local_library_add(&state, payload.params).await,
+        "library.local.refresh" => handle_local_library_refresh(&state).await,
+        "library.local.metadata.audit" => handle_local_metadata_audit(&state, payload.params).await,
+        "library.local.metadata.lookup" => {
+            handle_local_metadata_lookup(&state, payload.params).await
+        }
+        "library.local.metadata.apply" => handle_local_metadata_apply(&state, payload.params).await,
+        "library.local.listenbrainz.import" => {
+            handle_local_listenbrainz_import(&state, payload.params).await
+        }
+        "library.local.playlist.generate" => {
+            handle_local_playlist_generate(&state, payload.params).await
+        }
         "server.audiobookshelf.discover" => {
             handle_audiobookshelf_discover(&state, payload.params).await
         }
@@ -684,6 +698,11 @@ fn is_mutating_method(method: &str) -> bool {
     matches!(
         method,
         "server.connect"
+            | "library.local.add"
+            | "library.local.refresh"
+            | "library.local.metadata.apply"
+            | "library.local.listenbrainz.import"
+            | "library.local.playlist.generate"
             | "server.audiobookshelf.commit"
             | "server.audiobookshelf.cancelSetup"
             | "server.reauthenticate"
@@ -2819,6 +2838,402 @@ async fn handle_playlist_reorder(
     Ok(serde_json::json!({ "ok": true }))
 }
 
+async fn handle_local_library_add(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let params = params.ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "Missing params".to_string(),
+        data: None,
+    })?;
+    let path = params["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "Choose a local music folder".to_string(),
+            data: None,
+        })?;
+    if path.chars().count() > 32_768 {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "Local music folder path is too long".to_string(),
+            data: None,
+        });
+    }
+    let requested_name = optional_server_name(&params)?;
+    let requested_icon = optional_server_icon_for_connect(&params)?;
+    let source_path = std::path::PathBuf::from(path);
+    let provider = tokio::task::spawn_blocking(move || {
+        crate::providers::local::LocalFolderProvider::from_root(source_path)
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: -32603,
+        message: format!("Local library indexing task failed: {error}"),
+        data: None,
+    })?
+    .map_err(provider_error_to_rpc)?;
+
+    let root_url = provider.root_url().to_string();
+    let display_name = requested_name.unwrap_or_else(|| provider.display_name().to_string());
+    let icon = requested_icon.unwrap_or_else(|| "folder-music".to_string());
+    let song_count = provider.song_count();
+    let provider: Arc<dyn MediaProvider> = Arc::new(provider);
+    let local_id = state
+        .db
+        .upsert_server(
+            &root_url,
+            "localFolder",
+            "",
+            Some("local-v1"),
+            Some(&display_name),
+            Some(&icon),
+            None,
+        )
+        .map_err(storage_error_to_rpc)?;
+    let record = state
+        .db
+        .get_server(&local_id)
+        .map_err(storage_error_to_rpc)?
+        .ok_or(JsonRpcError {
+            code: ERR_STORAGE_ERROR,
+            message: "Local library was not persisted".to_string(),
+            data: None,
+        })?;
+    let portable_id = record.server_id.ok_or(JsonRpcError {
+        code: ERR_STORAGE_ERROR,
+        message: "Local library has no portable identifier".to_string(),
+        data: None,
+    })?;
+    {
+        let mut manager = state.server_manager.write().await;
+        manager.load_from_db(&state.db);
+        manager.providers.insert(local_id.clone(), provider);
+    }
+    if record.selected {
+        sync_selected_config(state, &local_id)?;
+    }
+    *state.last_connection_check.lock().await = None;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "serverId": portable_id,
+        "localId": local_id,
+        "serverType": "localFolder",
+        "serverVersion": "local-v1",
+        "songCount": song_count,
+    }))
+}
+
+async fn handle_local_library_refresh(state: &AppState) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let url = record.url.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        crate::providers::local::LocalFolderProvider::from_file_url(&url)
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Local library rescan task failed: {error}"),
+        data: None,
+    })?
+    .map_err(provider_error_to_rpc)?;
+    let song_count = provider.song_count();
+    state
+        .server_manager
+        .write()
+        .await
+        .providers
+        .insert(record.id, Arc::new(provider));
+    *state.last_connection_check.lock().await = None;
+    Ok(serde_json::json!({ "ok": true, "songCount": song_count }))
+}
+
+fn selected_local_source(state: &AppState) -> Result<crate::db::ServerConfig, JsonRpcError> {
+    let record = current_server_config(state)?.ok_or(JsonRpcError {
+        code: ERR_NOT_FOUND,
+        message: "No library is selected".to_string(),
+        data: None,
+    })?;
+    if record.server_type != "localFolder" {
+        return Err(JsonRpcError {
+            code: ERR_UNSUPPORTED_CAPABILITY,
+            message: "Library tools require a selected local music folder".to_string(),
+            data: Some(serde_json::json!({ "errorCode": "LOCAL_LIBRARY_REQUIRED" })),
+        });
+    }
+    Ok(record)
+}
+
+async fn handle_local_metadata_audit(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    let offset = params
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(usize::MAX as u64) as usize;
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(1, 500) as usize;
+    let issues_only = params
+        .get("issuesOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let url = record.url;
+    let page = tokio::task::spawn_blocking(move || {
+        let provider = crate::library_tools::local_provider_from_url(&url)?;
+        Ok::<_, ProviderError>(provider.metadata_audit(offset, limit, issues_only))
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Local metadata audit task failed: {error}"),
+        data: None,
+    })?
+    .map_err(provider_error_to_rpc)?;
+    serde_json::to_value(page).map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Failed to encode local metadata audit: {error}"),
+        data: None,
+    })
+}
+
+fn local_track_identity(params: &Value) -> Result<(String, String), JsonRpcError> {
+    let song_id = params
+        .get("songId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "songId is required".to_string(),
+            data: None,
+        })?;
+    let version = params
+        .get("expectedVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 1024)
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "expectedVersion is required".to_string(),
+            data: None,
+        })?;
+    Ok((song_id.to_string(), version.to_string()))
+}
+
+async fn handle_local_metadata_lookup(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let params = params.ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "Missing params".to_string(),
+        data: None,
+    })?;
+    let (song_id, expected_version) = local_track_identity(&params)?;
+    let url = record.url;
+    let track = tokio::task::spawn_blocking(move || {
+        let provider = crate::library_tools::local_provider_from_url(&url)?;
+        provider.metadata_track(&song_id, &expected_version)
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Metadata lookup preparation failed: {error}"),
+        data: None,
+    })?
+    .map_err(provider_error_to_rpc)?;
+    let result = crate::metadata_tools::lookup_musicbrainz(track)
+        .await
+        .map_err(|error| JsonRpcError {
+            code: ERR_INTERNAL_ERROR,
+            message: error.to_string(),
+            data: Some(serde_json::json!({ "errorCode": "METADATA_LOOKUP_FAILED" })),
+        })?;
+    serde_json::to_value(result).map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Failed to encode metadata candidates: {error}"),
+        data: None,
+    })
+}
+
+async fn handle_local_metadata_apply(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let params = params.ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "Missing params".to_string(),
+        data: None,
+    })?;
+    let (song_id, expected_version) = local_track_identity(&params)?;
+    let patch_value = params.get("patch").cloned().ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "patch is required".to_string(),
+        data: None,
+    })?;
+    let patch: crate::metadata_tools::MetadataPatch =
+        serde_json::from_value(patch_value).map_err(|error| JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: format!("Invalid metadata patch: {error}"),
+            data: None,
+        })?;
+    let result =
+        crate::metadata_tools::apply_metadata(record.url.clone(), song_id, expected_version, patch)
+            .await
+            .map_err(|error| JsonRpcError {
+                code: ERR_INTERNAL_ERROR,
+                message: error.to_string(),
+                data: Some(serde_json::json!({ "errorCode": "METADATA_WRITE_FAILED" })),
+            })?;
+    let refreshed = crate::library_tools::local_provider_from_url(&record.url)
+        .map_err(provider_error_to_rpc)?;
+    state
+        .server_manager
+        .write()
+        .await
+        .providers
+        .insert(record.id, Arc::new(refreshed));
+    serde_json::to_value(result).map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Failed to encode metadata write result: {error}"),
+        data: None,
+    })
+}
+
+async fn handle_local_listenbrainz_import(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let params = params.ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "Missing params".to_string(),
+        data: None,
+    })?;
+    let username = params
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "ListenBrainz username is required".to_string(),
+            data: None,
+        })?
+        .to_string();
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(crate::listenbrainz::ListenBrainzMixKind::parse)
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "ListenBrainz kind must be weekly-exploration, weekly-jams, or daily-jams"
+                .to_string(),
+            data: None,
+        })?;
+    let write = params
+        .get("write")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result =
+        crate::listenbrainz::import_listenbrainz(record.url.clone(), username, kind, write)
+            .await
+            .map_err(|error| JsonRpcError {
+                code: ERR_INTERNAL_ERROR,
+                message: error.to_string(),
+                data: Some(serde_json::json!({ "errorCode": "LISTENBRAINZ_IMPORT_FAILED" })),
+            })?;
+    if write {
+        let refreshed = crate::library_tools::local_provider_from_url(&record.url)
+            .map_err(provider_error_to_rpc)?;
+        state
+            .server_manager
+            .write()
+            .await
+            .providers
+            .insert(record.id, Arc::new(refreshed));
+    }
+    serde_json::to_value(result).map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Failed to encode ListenBrainz import: {error}"),
+        data: None,
+    })
+}
+
+async fn handle_local_playlist_generate(
+    state: &AppState,
+    params: Option<Value>,
+) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let params = params.ok_or(JsonRpcError {
+        code: ERR_INVALID_PARAMS,
+        message: "Missing params".to_string(),
+        data: None,
+    })?;
+    let kind = params["kind"]
+        .as_str()
+        .and_then(crate::library_tools::LocalMixKind::parse)
+        .ok_or(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "Playlist kind must be discovery, weekly, or daily".to_string(),
+            data: None,
+        })?;
+    let max_tracks = params
+        .get("maxTracks")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, 500) as usize);
+    let write = params
+        .get("write")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let url = record.url.clone();
+    let (result, refreshed) = tokio::task::spawn_blocking(move || {
+        let provider =
+            crate::library_tools::local_provider_from_url(&url).map_err(anyhow::Error::from)?;
+        let result = crate::library_tools::build_local_mix(&provider, kind, max_tracks, write)?;
+        let refreshed = if write {
+            Some(crate::library_tools::local_provider_from_url(&url).map_err(anyhow::Error::from)?)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((result, refreshed))
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Playlist generation task failed: {error}"),
+        data: None,
+    })?
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: error.to_string(),
+        data: None,
+    })?;
+    if let Some(provider) = refreshed {
+        state
+            .server_manager
+            .write()
+            .await
+            .providers
+            .insert(record.id, Arc::new(provider));
+    }
+    serde_json::to_value(result).map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Failed to encode generated playlist: {error}"),
+        data: None,
+    })
+}
+
 async fn handle_server_connect(
     state: &AppState,
     params: Option<Value>,
@@ -2978,6 +3393,7 @@ async fn handle_server_connect(
                 })),
             });
         }
+        crate::providers::ServerType::LocalFolder => {}
         crate::providers::ServerType::Unknown => {}
     }
 
@@ -3710,12 +4126,16 @@ async fn handle_save_credentials(params: Option<Value>) -> Result<Value, JsonRpc
 
 fn selected_credentials_response(db: &crate::db::Database) -> Result<Option<Value>, JsonRpcError> {
     if let Some(server) = db.get_server_config().map_err(storage_error_to_rpc)? {
-        let credential =
-            CredentialManager::find_server_credential(&server.id).map_err(storage_error_to_rpc)?;
+        let credential = if server.server_type == "localFolder" {
+            None
+        } else {
+            CredentialManager::find_server_credential(&server.id).map_err(storage_error_to_rpc)?
+        };
         let user_id = match server.server_type.as_str() {
             "jellyfin" => credential.as_ref().and_then(|creds| creds.user_id.clone()),
             "subsonic" | "openSubsonic" => Some(server.username.clone()),
             "audiobookshelf" => Some(server.username.clone()),
+            "localFolder" => None,
             other => {
                 return Err(storage_error_to_rpc(anyhow::anyhow!(
                     "Unsupported selected server type: {}",
@@ -3723,7 +4143,10 @@ fn selected_credentials_response(db: &crate::db::Database) -> Result<Option<Valu
                 )));
             }
         };
-        let token = if server.server_type == "audiobookshelf" {
+        let token = if matches!(
+            server.server_type.as_str(),
+            "audiobookshelf" | "localFolder"
+        ) {
             None
         } else {
             credential.map(|creds| creds.token_or_password)
@@ -3880,6 +4303,12 @@ async fn handle_get_daemon_state(state: &AppState) -> Result<Value, JsonRpcError
     let selected_server_portable_id = selected_server.and_then(|s| s.server_id.clone());
     let server_type = selected_server.map(|c| c.server_type.clone());
     let server_version = selected_server.and_then(|c| c.server_version.clone());
+    // Local-folder playback is intentionally not implemented yet. Keep this
+    // explicit capability separate from `serverId`: local items still need a
+    // portable identity for basket and sync routing.
+    let supports_playback = server_type
+        .as_deref()
+        .is_some_and(|kind| kind != "localFolder");
     let current_server = selected_server.map(|config| {
         // Story 2.13: `serverId` here carries the PORTABLE id to match the rest
         // of the contract (server.list, server.connect, daemon_state.servers[]).
@@ -3950,6 +4379,7 @@ async fn handle_get_daemon_state(state: &AppState) -> Result<Value, JsonRpcError
         "destinations": destination_snapshot.destinations,
         "deviceDiscoveryIssues": device_discovery_issues,
         "supportsPlaylistWrite": supports_playlist_write,
+        "supportsPlayback": supports_playback,
     }))
 }
 
@@ -4281,6 +4711,9 @@ async fn provider_legacy_item_count(
 }
 
 fn provider_track_size(track: &Song) -> u64 {
+    if let Some(size_bytes) = track.size_bytes {
+        return size_bytes;
+    }
     track
         .bitrate_kbps
         .map(|kbps| (u64::from(kbps) * 1_000 / 8) * u64::from(track.duration_seconds))
@@ -15289,6 +15722,36 @@ mod tests {
             Some("audio/flac")
         );
         assert_eq!(items[0].provider_suffix.as_deref(), Some("flac"));
+    }
+
+    #[test]
+    fn provider_song_to_desired_item_prefers_exact_source_size() {
+        let song = crate::domain::models::Song {
+            id: "local-song".to_string(),
+            title: "Track".to_string(),
+            artist_id: None,
+            artist_name: Some("Artist".to_string()),
+            album_id: None,
+            album_title: Some("Album".to_string()),
+            duration_seconds: 275,
+            bitrate_kbps: Some(906),
+            track_number: Some(1),
+            disc_number: None,
+            cover_art_id: None,
+            date_added: None,
+            last_played_at: None,
+            play_count: None,
+            is_favorite: None,
+            content_type: Some("audio/flac".to_string()),
+            suffix: Some("flac".to_string()),
+            size_bytes: Some(31_340_288),
+            album_loudness: Default::default(),
+            provider_metadata: Default::default(),
+        };
+
+        let desired = provider_song_to_desired_item(&song);
+
+        assert_eq!(desired.size_bytes, 31_340_288);
     }
 
     #[tokio::test]

@@ -1,9 +1,13 @@
 import type { AudiobookshelfLibraryChoice } from './rpc';
 
-export type LoginProviderChoice = 'auto' | 'jellyfin' | 'subsonic' | 'audiobookshelf';
+export type LoginProviderChoice = 'auto' | 'jellyfin' | 'subsonic' | 'audiobookshelf' | 'localFolder';
 
 export function isLoginProviderChoice(value: string): value is LoginProviderChoice {
-    return value === 'auto' || value === 'jellyfin' || value === 'subsonic' || value === 'audiobookshelf';
+    return value === 'auto'
+        || value === 'jellyfin'
+        || value === 'subsonic'
+        || value === 'audiobookshelf'
+        || value === 'localFolder';
 }
 
 export function shouldUseAudiobookshelfDiscovery(

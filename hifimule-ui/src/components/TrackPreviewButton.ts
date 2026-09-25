@@ -6,9 +6,10 @@ export function createTrackPreviewButton(
     serverId: string | null | undefined,
     trackId: string,
     title: string,
+    supportsPlayback = true,
 ): HTMLElement {
     const button = document.createElement('sl-icon-button') as any;
-    const source = serverId ? { serverId, trackId } : null;
+    const source = supportsPlayback && serverId ? { serverId, trackId } : null;
     button.name = 'soundwave';
     button.label = t('playback.preview_track', { title });
     button.disabled = !source;

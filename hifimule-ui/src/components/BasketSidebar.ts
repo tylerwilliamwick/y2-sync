@@ -8,7 +8,7 @@ import { InitDeviceModal } from './InitDeviceModal';
 import { AutoFillPanel } from './AutoFillPanel';
 import { AutoFillPipeline, defaultLegacyPipeline, normalizePipeline } from '../state/autoFill';
 import { t } from '../i18n';
-import { setPlaylistWriteCapability, invalidatePlaylistsCache } from '../library';
+import { setLocalLibraryCapability, setPlaybackCapability, setPlaylistWriteCapability, invalidatePlaylistsCache } from '../library';
 import { formatServerIdentity } from '../serverIdentity';
 import type { ServerSummary } from '../rpc';
 
@@ -316,6 +316,8 @@ export class BasketSidebar {
             const newSupportsPlaylist = (state.supportsPlaylistWrite === true);
             this.supportsPlaylistWrite = newSupportsPlaylist;
             setPlaylistWriteCapability(newSupportsPlaylist);
+            setPlaybackCapability(state.supportsPlayback === true);
+            setLocalLibraryCapability(state.serverType === 'localFolder');
         }
 
         // Attach to daemon-initiated sync if one is running and we're not already tracking it

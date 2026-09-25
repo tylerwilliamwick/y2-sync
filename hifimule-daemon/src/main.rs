@@ -81,6 +81,9 @@ pub mod device_io;
 // the current daemon binary only uses the sync-facing subset.
 #[allow(dead_code)]
 mod domain;
+mod library_tools;
+mod listenbrainz;
+mod metadata_tools;
 mod notifications;
 mod paths;
 mod playback;

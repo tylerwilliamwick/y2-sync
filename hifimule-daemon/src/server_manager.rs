@@ -122,11 +122,10 @@ impl ServerManager {
 pub(crate) async fn connect_provider_for(
     record: &ServerRecord,
 ) -> Result<Arc<dyn MediaProvider>, ProviderError> {
-    let creds = CredentialManager::get_server_credential(&record.id)
-        .map_err(|e| ProviderError::Auth(e.to_string()))?;
-
     match record.server_type.as_str() {
         "jellyfin" => {
+            let creds = CredentialManager::get_server_credential(&record.id)
+                .map_err(|e| ProviderError::Auth(e.to_string()))?;
             let user_id = creds
                 .user_id
                 .clone()
@@ -142,6 +141,8 @@ pub(crate) async fn connect_provider_for(
             ) as Arc<dyn MediaProvider>)
         }
         "subsonic" | "openSubsonic" => {
+            let creds = CredentialManager::get_server_credential(&record.id)
+                .map_err(|e| ProviderError::Auth(e.to_string()))?;
             let credentials = ProviderCredentials {
                 server_url: record.url.clone(),
                 credential: CredentialKind::Password {
@@ -159,6 +160,8 @@ pub(crate) async fn connect_provider_for(
             Ok(Arc::new(provider) as Arc<dyn MediaProvider>)
         }
         "audiobookshelf" => {
+            let creds = CredentialManager::get_server_credential(&record.id)
+                .map_err(|e| ProviderError::Auth(e.to_string()))?;
             let library_id = record.provider_library_id.as_deref().ok_or_else(|| {
                 ProviderError::StaleConfiguration(
                     "missing Audiobookshelf library identifier".into(),
@@ -182,6 +185,19 @@ pub(crate) async fn connect_provider_for(
                     role,
                 )
                 .await?;
+            Ok(Arc::new(provider) as Arc<dyn MediaProvider>)
+        }
+        "localFolder" => {
+            let url = record.url.clone();
+            let provider = tokio::task::spawn_blocking(move || {
+                crate::providers::local::LocalFolderProvider::from_file_url(&url)
+            })
+            .await
+            .map_err(|error| {
+                ProviderError::Other(anyhow::anyhow!(
+                    "local library indexing task failed: {error}"
+                ))
+            })??;
             Ok(Arc::new(provider) as Arc<dyn MediaProvider>)
         }
         other => Err(ProviderError::UnsupportedCapability(format!(

@@ -49,6 +49,7 @@ function makePanelState<T>(): PanelState<T> {
 export class TracksBrowseView {
     private container: HTMLElement;
     private supportsPlaylistWrite: boolean;
+    private supportsPlayback: boolean;
 
     private selectedArtistId: string | null = null;
     private selectedAlbumId: string | null = null;
@@ -82,9 +83,14 @@ export class TracksBrowseView {
     private selectionAnchorIdx: number | null = null;
     private _escapeHandler: ((e: KeyboardEvent) => void) | null = null;
 
-    constructor(container: HTMLElement, supportsPlaylistWrite = false) {
+    constructor(container: HTMLElement, supportsPlaylistWrite = false, supportsPlayback = true) {
         this.container = container;
         this.supportsPlaylistWrite = supportsPlaylistWrite;
+        this.supportsPlayback = supportsPlayback;
+    }
+
+    setPlaybackCapability(supportsPlayback: boolean): void {
+        this.supportsPlayback = supportsPlayback;
     }
 
     async load(): Promise<void> {
@@ -489,7 +495,7 @@ export class TracksBrowseView {
         row.setAttribute('tabindex', '0');
         row.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
         row.innerHTML = `<span class="curation-row-label" title="${this.escapeAttr(album.name)}">${this.escapeHtml(album.name)}</span>`;
-        const play = createAlbumPlayButton(album.id, album.serverId, album.name);
+        const play = createAlbumPlayButton(album.id, album.serverId, album.name, 'album', this.supportsPlayback);
         row.appendChild(play);
         row.addEventListener('click', () => this.selectAlbum(album.id));
         row.addEventListener('keydown', (e) => {
@@ -560,9 +566,9 @@ export class TracksBrowseView {
         const playBtn = document.createElement('sl-icon-button') as any;
         playBtn.name = 'play-fill';
         playBtn.label = t('playback.play_track', { title: track.title });
-        playBtn.disabled = !track.serverId;
+        playBtn.disabled = !this.supportsPlayback || !track.serverId;
         playBtn.style.fontSize = '1.1rem';
-        const playbackSource = track.serverId
+        const playbackSource = this.supportsPlayback && track.serverId
             ? { serverId: track.serverId, trackId: track.id }
             : null;
         playBtn.addEventListener('mousedown', (event: Event) => event.stopPropagation());
@@ -574,11 +580,11 @@ export class TracksBrowseView {
         });
         row.appendChild(playBtn);
 
-        const previewBtn = createTrackPreviewButton(track.serverId, track.id, track.title) as any;
+        const previewBtn = createTrackPreviewButton(track.serverId, track.id, track.title, this.supportsPlayback) as any;
         previewBtn.style.fontSize = '1.1rem';
         row.appendChild(previewBtn);
 
-        const queueBtn = createTrackQueueButton(track.serverId, track.id, track.title) as any;
+        const queueBtn = createTrackQueueButton(track.serverId, track.id, track.title, this.supportsPlayback) as any;
         queueBtn.style.fontSize = '1.1rem';
         row.appendChild(queueBtn);
 

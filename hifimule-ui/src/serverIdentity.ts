@@ -9,6 +9,7 @@ export const SERVER_ICON_OPTIONS = [
     'headphones',
     'collection-play',
     'disc',
+    'folder-music',
     'broadcast-pin',
     'book',
 ] as const;
@@ -22,6 +23,7 @@ export function serverTypeLabel(type: string, role?: ServerSummary['libraryRole'
             if (role === 'audiobook') return t('server.audiobookshelf.books');
             if (role === 'podcast') return t('server.audiobookshelf.podcasts');
             return 'Audiobookshelf';
+        case 'localFolder': return t('server.local_folder');
         default: return t('server.default');
     }
 }
@@ -32,6 +34,7 @@ export function defaultServerIcon(type: string, role?: ServerSummary['libraryRol
         case 'openSubsonic':
         case 'subsonic': return 'music-note-list';
         case 'audiobookshelf': return role === 'podcast' ? 'broadcast-pin' : 'book';
+        case 'localFolder': return 'folder-music';
         default: return 'hdd-network';
     }
 }
@@ -47,7 +50,8 @@ export interface ServerIdentity {
 
 export function serverHost(url: string): string {
     try {
-        return new URL(url).host;
+        const parsed = new URL(url);
+        return parsed.protocol === 'file:' ? '' : parsed.host;
     } catch {
         return url.replace(/^https?:\/\//i, '').replace(/\/+$/, '') || url;
     }
@@ -58,14 +62,17 @@ export function formatServerIdentity(server: ServerSummary): ServerIdentity {
     const host = serverHost(server.url);
     const label = server.name?.trim() || providerLabel || server.username || host || t('server.default');
     const icon = server.icon?.trim() || defaultServerIcon(server.serverType, server.libraryRole);
-    const secondaryParts = [providerLabel, server.username, host].filter(Boolean);
+    const secondaryParts = server.serverType === 'localFolder'
+        ? [providerLabel, t('server.on_this_computer')]
+        : [providerLabel, server.username, host].filter(Boolean);
     const secondaryText = secondaryParts.join(' - ');
+    const tooltip = secondaryText ? `${label} - ${secondaryText}` : label;
     return {
         label,
         icon,
         providerLabel,
         host,
         secondaryText,
-        tooltip: `${label} - ${secondaryText}`,
+        tooltip,
     };
 }
