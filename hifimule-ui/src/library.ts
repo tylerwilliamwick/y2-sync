@@ -28,6 +28,7 @@ import {
     fetchBrowseFavoriteItems,
     fetchBrowseSearch,
     serverList,
+    localLibraryRefresh,
     getImageUrl,
     rpcCall,
     playbackPlayTrack,
@@ -44,8 +45,24 @@ import { t } from './i18n';
 import { showToast, ERROR_TOAST_DURATION } from './toast';
 
 let _supportsPlaylistWrite = false;
+let _supportsPlayback = false;
+let _isLocalLibrary = false;
+let _localRefreshInFlight = false;
 export function setPlaylistWriteCapability(v: boolean): void {
     _supportsPlaylistWrite = v;
+}
+
+export function setPlaybackCapability(v: boolean): void {
+    const changed = _supportsPlayback !== v;
+    _supportsPlayback = v;
+    _tracksBrowseView?.setPlaybackCapability(v);
+    if (changed && state.availableModes.length > 0) renderCurrentView();
+}
+
+export function setLocalLibraryCapability(v: boolean): void {
+    if (_isLocalLibrary === v) return;
+    _isLocalLibrary = v;
+    if (state.availableModes.length > 0) renderModeBar();
 }
 
 function modeLabel(mode: BrowseMode): string {
@@ -163,6 +180,22 @@ export function clearNavigationCache() {
     // browseMode, availableModes, and listViewMode are intentionally preserved
     _tracksBrowseView?.destroy();
     _tracksBrowseView = null;
+}
+
+async function refreshLocalLibrary(): Promise<void> {
+    if (!_isLocalLibrary || _localRefreshInFlight) return;
+    _localRefreshInFlight = true;
+    renderModeBar();
+    try {
+        await localLibraryRefresh();
+        clearNavigationCache();
+        await initLibraryView();
+    } catch (error) {
+        showToast((error as Error).message, 'danger');
+    } finally {
+        _localRefreshInFlight = false;
+        renderModeBar();
+    }
 }
 
 // --- Scroll helpers ---
@@ -544,6 +577,25 @@ function renderModeBar() {
         if (button !== next) bar.insertBefore(button, next);
         next = button.nextElementSibling;
     }
+    const existingRefresh = bar.querySelector<SlButton>('sl-button[data-action="refresh-library"]');
+    if (_isLocalLibrary) {
+        const refresh = existingRefresh ?? document.createElement('sl-button') as SlButton;
+        if (!existingRefresh) {
+            refresh.setAttribute('data-action', 'refresh-library');
+            refresh.size = 'small';
+            const icon = document.createElement('sl-icon');
+            icon.name = 'arrow-clockwise';
+            icon.slot = 'prefix';
+            refresh.append(icon, document.createTextNode(t('library.refresh')));
+            refresh.addEventListener('click', () => { void refreshLocalLibrary(); });
+        }
+        refresh.title = t('library.refresh');
+        refresh.disabled = state.loading || _localRefreshInFlight;
+        refresh.setAttribute('aria-disabled', String(refresh.disabled));
+        if (refresh !== next) bar.appendChild(refresh);
+    } else {
+        existingRefresh?.remove();
+    }
     renderViewToggle();
     if (focused && focused !== document.activeElement && existing.size > 0
         && Array.from(existing.values()).includes(focused as SlButton)) {
@@ -757,7 +809,7 @@ function renderGrid(items: BrowseDisplayItem[], onCurate?: (id: string, name: st
     items.forEach(item => {
         const selEnabled = true;
 
-        const card = MediaCard.create(item, 'items', false, () => navigateToBrowseItem(item), selEnabled, _supportsPlaylistWrite, onCurate);
+        const card = MediaCard.create(item, 'items', false, () => navigateToBrowseItem(item), selEnabled, _supportsPlaylistWrite, onCurate, _supportsPlayback);
         card.setAttribute('data-name', item.name);
         grid.appendChild(card);
     });
@@ -1288,8 +1340,8 @@ function renderListRow(item: BrowseDisplayItem, index: number, onCurate?: (id: s
         const play = document.createElement('sl-icon-button') as any;
         play.name = 'play-fill';
         play.label = t(isPart ? 'library.books.play_part' : 'playback.play_track', { title: item.name });
-        play.disabled = !item.serverId;
-        const playbackSource = item.serverId
+        play.disabled = !_supportsPlayback || !item.serverId;
+        const playbackSource = _supportsPlayback && item.serverId
             ? { serverId: item.serverId, trackId: item.id }
             : null;
         play.addEventListener('mousedown', (event: Event) => event.stopPropagation());
@@ -1301,12 +1353,12 @@ function renderListRow(item: BrowseDisplayItem, index: number, onCurate?: (id: s
         });
         row.appendChild(play);
         if (!isPart) {
-            row.appendChild(createTrackPreviewButton(item.serverId, item.id, item.name));
-            row.appendChild(createTrackQueueButton(item.serverId, item.id, item.name));
+            row.appendChild(createTrackPreviewButton(item.serverId, item.id, item.name, _supportsPlayback));
+            row.appendChild(createTrackQueueButton(item.serverId, item.id, item.name, _supportsPlayback));
         }
     }
     if (item.type === 'MusicAlbum' || item.type === 'Book') {
-        const play = createAlbumPlayButton(item.id, item.serverId, item.name, item.type === 'Book' ? 'book' : 'album');
+        const play = createAlbumPlayButton(item.id, item.serverId, item.name, item.type === 'Book' ? 'book' : 'album', _supportsPlayback);
         row.appendChild(play);
     }
     // Curate button: appears on Playlist rows when playlist write is supported (mirrors MediaCard grid behavior)
@@ -1613,7 +1665,7 @@ function loadTracksView(): void {
     if (_tracksBrowseView) {
         _tracksBrowseView.remount();
     } else {
-        _tracksBrowseView = new TracksBrowseView(container, _supportsPlaylistWrite);
+        _tracksBrowseView = new TracksBrowseView(container, _supportsPlaylistWrite, _supportsPlayback);
         _tracksBrowseView.load();
     }
 }

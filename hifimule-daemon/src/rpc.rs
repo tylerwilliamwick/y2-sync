@@ -514,6 +514,7 @@ async fn handler(
         "test_connection" => handle_test_connection(&state, payload.params).await,
         "server.connect" => handle_server_connect(&state, payload.params).await,
         "library.local.add" => handle_local_library_add(&state, payload.params).await,
+        "library.local.refresh" => handle_local_library_refresh(&state).await,
         "library.local.metadata.audit" => handle_local_metadata_audit(&state, payload.params).await,
         "library.local.metadata.lookup" => {
             handle_local_metadata_lookup(&state, payload.params).await
@@ -698,6 +699,7 @@ fn is_mutating_method(method: &str) -> bool {
         method,
         "server.connect"
             | "library.local.add"
+            | "library.local.refresh"
             | "library.local.metadata.apply"
             | "library.local.listenbrainz.import"
             | "library.local.playlist.generate"
@@ -2926,6 +2928,30 @@ async fn handle_local_library_add(
     }))
 }
 
+async fn handle_local_library_refresh(state: &AppState) -> Result<Value, JsonRpcError> {
+    let record = selected_local_source(state)?;
+    let url = record.url.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        crate::providers::local::LocalFolderProvider::from_file_url(&url)
+    })
+    .await
+    .map_err(|error| JsonRpcError {
+        code: ERR_INTERNAL_ERROR,
+        message: format!("Local library rescan task failed: {error}"),
+        data: None,
+    })?
+    .map_err(provider_error_to_rpc)?;
+    let song_count = provider.song_count();
+    state
+        .server_manager
+        .write()
+        .await
+        .providers
+        .insert(record.id, Arc::new(provider));
+    *state.last_connection_check.lock().await = None;
+    Ok(serde_json::json!({ "ok": true, "songCount": song_count }))
+}
+
 fn selected_local_source(state: &AppState) -> Result<crate::db::ServerConfig, JsonRpcError> {
     let record = current_server_config(state)?.ok_or(JsonRpcError {
         code: ERR_NOT_FOUND,
@@ -4277,6 +4303,12 @@ async fn handle_get_daemon_state(state: &AppState) -> Result<Value, JsonRpcError
     let selected_server_portable_id = selected_server.and_then(|s| s.server_id.clone());
     let server_type = selected_server.map(|c| c.server_type.clone());
     let server_version = selected_server.and_then(|c| c.server_version.clone());
+    // Local-folder playback is intentionally not implemented yet. Keep this
+    // explicit capability separate from `serverId`: local items still need a
+    // portable identity for basket and sync routing.
+    let supports_playback = server_type
+        .as_deref()
+        .is_some_and(|kind| kind != "localFolder");
     let current_server = selected_server.map(|config| {
         // Story 2.13: `serverId` here carries the PORTABLE id to match the rest
         // of the contract (server.list, server.connect, daemon_state.servers[]).
@@ -4347,6 +4379,7 @@ async fn handle_get_daemon_state(state: &AppState) -> Result<Value, JsonRpcError
         "destinations": destination_snapshot.destinations,
         "deviceDiscoveryIssues": device_discovery_issues,
         "supportsPlaylistWrite": supports_playlist_write,
+        "supportsPlayback": supports_playback,
     }))
 }
 
@@ -4678,6 +4711,9 @@ async fn provider_legacy_item_count(
 }
 
 fn provider_track_size(track: &Song) -> u64 {
+    if let Some(size_bytes) = track.size_bytes {
+        return size_bytes;
+    }
     track
         .bitrate_kbps
         .map(|kbps| (u64::from(kbps) * 1_000 / 8) * u64::from(track.duration_seconds))
@@ -15686,6 +15722,36 @@ mod tests {
             Some("audio/flac")
         );
         assert_eq!(items[0].provider_suffix.as_deref(), Some("flac"));
+    }
+
+    #[test]
+    fn provider_song_to_desired_item_prefers_exact_source_size() {
+        let song = crate::domain::models::Song {
+            id: "local-song".to_string(),
+            title: "Track".to_string(),
+            artist_id: None,
+            artist_name: Some("Artist".to_string()),
+            album_id: None,
+            album_title: Some("Album".to_string()),
+            duration_seconds: 275,
+            bitrate_kbps: Some(906),
+            track_number: Some(1),
+            disc_number: None,
+            cover_art_id: None,
+            date_added: None,
+            last_played_at: None,
+            play_count: None,
+            is_favorite: None,
+            content_type: Some("audio/flac".to_string()),
+            suffix: Some("flac".to_string()),
+            size_bytes: Some(31_340_288),
+            album_loudness: Default::default(),
+            provider_metadata: Default::default(),
+        };
+
+        let desired = provider_song_to_desired_item(&song);
+
+        assert_eq!(desired.size_bytes, 31_340_288);
     }
 
     #[tokio::test]

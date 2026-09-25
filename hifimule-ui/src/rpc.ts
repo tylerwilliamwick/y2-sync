@@ -168,6 +168,10 @@ export async function localLibraryAdd(params: {
     return await rpcCall('library.local.add', params) as LocalLibraryAddResult;
 }
 
+export async function localLibraryRefresh(): Promise<{ ok: true; songCount: number }> {
+    return await rpcCall('library.local.refresh') as { ok: true; songCount: number };
+}
+
 export interface LocalMetadataTrack {
     songId: string;
     relativePath: string;

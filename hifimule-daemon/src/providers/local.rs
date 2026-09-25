@@ -183,6 +183,15 @@ impl LocalFolderProvider {
         self.index.songs.len()
     }
 
+    /// Rebuild the in-memory index after files change outside the app. The
+    /// server manager replaces the provider after a successful RPC rescan, but
+    /// keeping the operation here makes the scan semantics explicit and
+    /// testable without filesystem watchers.
+    pub fn rescan(&mut self) -> Result<usize, ProviderError> {
+        self.index = build_index(&self.root, &self.source_prefix)?;
+        Ok(self.index.songs.len())
+    }
+
     pub(crate) fn root_path(&self) -> &Path {
         &self.root
     }
@@ -1285,6 +1294,17 @@ mod tests {
         let playlist = provider.get_playlist(&playlists[0].id).await.unwrap();
         assert_eq!(playlist.tracks.len(), 2);
         assert_eq!(playlist.tracks[0].title, "02 - Second");
+    }
+
+    #[test]
+    fn rescan_refreshes_external_changes() {
+        let root = fixture();
+        let mut provider = LocalFolderProvider::from_root(root.path()).unwrap();
+        fs::write(root.path().join("Artist/Album/03 - Third.flac"), b"three").unwrap();
+        assert_eq!(provider.song_count(), 2);
+
+        assert_eq!(provider.rescan().unwrap(), 3);
+        assert_eq!(provider.song_count(), 3);
     }
 
     #[tokio::test]

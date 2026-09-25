@@ -50,6 +50,7 @@ export class MediaCard {
         deviceSelectionEnabled?: boolean,
         supportsPlaylistWrite?: boolean,
         onCurate?: (id: string, name: string) => void,
+        supportsPlayback = false,
     ): HTMLElement {
         const isBrowseItem = !('Id' in item);
         const itemId = isBrowseItem ? ((item as BrowseDisplayItem).basketId ?? (item as BrowseDisplayItem).id) : (item as JellyfinItem | JellyfinView).Id;
@@ -117,8 +118,8 @@ export class MediaCard {
             const play = document.createElement('sl-icon-button') as any;
             play.name = 'play-fill';
             play.label = t(isPart ? 'library.books.play_part' : 'playback.play_track', { title: itemName });
-            play.disabled = !audio.serverId;
-            const playbackSource = audio.serverId
+            play.disabled = !supportsPlayback || !audio.serverId;
+            const playbackSource = supportsPlayback && audio.serverId
                 ? { serverId: audio.serverId, trackId: audio.id }
                 : null;
             play.addEventListener('mousedown', (event: Event) => event.stopPropagation());
@@ -131,17 +132,17 @@ export class MediaCard {
             card.querySelector('.card-content')?.appendChild(play);
             if (!isPart) {
                 card.querySelector('.card-content')?.appendChild(
-                    createTrackPreviewButton(audio.serverId, audio.id, itemName),
+                    createTrackPreviewButton(audio.serverId, audio.id, itemName, supportsPlayback),
                 );
                 card.querySelector('.card-content')?.appendChild(
-                    createTrackQueueButton(audio.serverId, audio.id, itemName),
+                    createTrackQueueButton(audio.serverId, audio.id, itemName, supportsPlayback),
                 );
             }
         }
 
         if (isBrowseItem && ['MusicAlbum', 'Book'].includes((item as BrowseDisplayItem).type)) {
             const album = item as BrowseDisplayItem;
-            const play = createAlbumPlayButton(album.id, album.serverId, itemName, album.type === 'Book' ? 'book' : 'album');
+            const play = createAlbumPlayButton(album.id, album.serverId, itemName, album.type === 'Book' ? 'book' : 'album', supportsPlayback);
             card.querySelector('.card-content')?.appendChild(play);
         }
 

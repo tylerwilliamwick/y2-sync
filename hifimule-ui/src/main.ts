@@ -322,7 +322,9 @@ async function routeFromDaemonState(state: any): Promise<void> {
     basketStore.setActiveServerId(selectedServerPortableId);
 
     if (selectedServerId) {
-        const { initLibraryView } = await import('./library');
+        const { initLibraryView, setLocalLibraryCapability, setPlaybackCapability } = await import('./library');
+        setPlaybackCapability(state?.supportsPlayback === true);
+        setLocalLibraryCapability(state?.serverType === 'localFolder');
         initLibraryView();
     } else {
         renderLibraryNoServerSelected();

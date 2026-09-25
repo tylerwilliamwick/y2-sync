@@ -5,9 +5,10 @@ export function createTrackQueueButton(
     serverId: string | null | undefined,
     trackId: string,
     title: string,
+    supportsPlayback = false,
 ): HTMLElement {
     const button = document.createElement('sl-icon-button') as any;
-    const source = serverId ? { serverId, trackId } : null;
+    const source = supportsPlayback && serverId ? { serverId, trackId } : null;
     button.name = 'list-ul';
     button.label = t('playback.add_to_queue', { title });
     button.disabled = !source;

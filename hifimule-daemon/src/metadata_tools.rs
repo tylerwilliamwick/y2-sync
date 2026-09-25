@@ -58,6 +58,9 @@ pub(crate) struct MetadataPatch {
     pub title: String,
     pub artist: String,
     pub album: String,
+    // The UI sends these keys explicitly. `null` (or an empty MBID) means
+    // clear the corresponding tag; this prevents stale optional values from
+    // surviving a reviewed replacement.
     pub genre: Option<String>,
     pub year: Option<u32>,
     pub track_number: Option<u32>,
@@ -439,40 +442,7 @@ fn apply_patch_to_file(path: &Path, patch: &MetadataPatch, artwork: Option<&[u8]
     let tag = tagged
         .primary_tag_mut()
         .context("This audio format has no writable primary tag")?;
-    tag.set_title(patch.title.clone());
-    tag.set_artist(patch.artist.clone());
-    tag.set_album(patch.album.clone());
-    if let Some(value) = patch.genre.as_ref() {
-        tag.set_genre(value.clone());
-    }
-    if let Some(value) = patch.track_number {
-        tag.set_track(value);
-    }
-    if let Some(value) = patch.disc_number {
-        tag.set_disk(value);
-    }
-    if let Some(value) = patch.year {
-        tag.insert_text(ItemKey::RecordingDate, value.to_string());
-    }
-    tag.insert_text(
-        ItemKey::MusicBrainzRecordingId,
-        patch.recording_mbid.clone(),
-    );
-    insert_optional(
-        tag,
-        ItemKey::MusicBrainzArtistId,
-        patch.artist_mbid.as_ref(),
-    );
-    insert_optional(
-        tag,
-        ItemKey::MusicBrainzReleaseId,
-        patch.release_mbid.as_ref(),
-    );
-    insert_optional(
-        tag,
-        ItemKey::MusicBrainzReleaseGroupId,
-        patch.release_group_mbid.as_ref(),
-    );
+    apply_patch_to_tag(tag, patch);
     if let Some(bytes) = artwork {
         let mut picture = Picture::from_reader(&mut Cursor::new(bytes))
             .context("Downloaded artwork is not a supported image")?;
@@ -488,10 +458,63 @@ fn apply_patch_to_file(path: &Path, patch: &MetadataPatch, artwork: Option<&[u8]
     Ok(())
 }
 
-fn insert_optional(tag: &mut Tag, key: ItemKey, value: Option<&String>) {
-    if let Some(value) = value {
-        tag.insert_text(key, value.clone());
+fn apply_patch_to_tag(tag: &mut Tag, patch: &MetadataPatch) {
+    tag.set_title(patch.title.clone());
+    tag.set_artist(patch.artist.clone());
+    tag.set_album(patch.album.clone());
+    match non_empty(patch.genre.as_ref()) {
+        Some(value) => tag.set_genre(value.to_string()),
+        None => tag.remove_genre(),
     }
+    match patch.track_number {
+        Some(value) => tag.set_track(value),
+        None => tag.remove_track(),
+    }
+    match patch.disc_number {
+        Some(value) => tag.set_disk(value),
+        None => tag.remove_disk(),
+    }
+    match patch.year {
+        Some(value) => {
+            tag.insert_text(ItemKey::RecordingDate, value.to_string());
+        }
+        None => tag.remove_date(),
+    }
+    replace_optional_text(
+        tag,
+        ItemKey::MusicBrainzRecordingId,
+        non_empty(Some(&patch.recording_mbid)),
+    );
+    replace_optional_text(
+        tag,
+        ItemKey::MusicBrainzArtistId,
+        non_empty(patch.artist_mbid.as_ref()),
+    );
+    replace_optional_text(
+        tag,
+        ItemKey::MusicBrainzReleaseId,
+        non_empty(patch.release_mbid.as_ref()),
+    );
+    replace_optional_text(
+        tag,
+        ItemKey::MusicBrainzReleaseGroupId,
+        non_empty(patch.release_group_mbid.as_ref()),
+    );
+}
+
+fn non_empty(value: Option<&String>) -> Option<&str> {
+    value
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn replace_optional_text(tag: &mut Tag, key: ItemKey, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            tag.insert_text(key, value.to_string());
+        }
+        None => tag.remove_key(key),
+    };
 }
 
 fn verify_patch(path: &Path, patch: &MetadataPatch, artwork: bool) -> Result<()> {
@@ -500,44 +523,7 @@ fn verify_patch(path: &Path, patch: &MetadataPatch, artwork: bool) -> Result<()>
         .primary_tag()
         .or_else(|| tagged.first_tag())
         .context("Written tag is missing")?;
-    if tag.title().as_deref() != Some(patch.title.as_str())
-        || tag.artist().as_deref() != Some(patch.artist.as_str())
-        || tag.album().as_deref() != Some(patch.album.as_str())
-        || tag.get_string(ItemKey::MusicBrainzRecordingId) != Some(patch.recording_mbid.as_str())
-    {
-        bail!("Written tags did not match the reviewed values");
-    }
-    if patch
-        .genre
-        .as_deref()
-        .is_some_and(|value| tag.genre().as_deref() != Some(value))
-        || patch
-            .track_number
-            .is_some_and(|value| tag.track() != Some(value))
-        || patch
-            .disc_number
-            .is_some_and(|value| tag.disk() != Some(value))
-        || patch
-            .year
-            .is_some_and(|value| tag.date().map(|date| u32::from(date.year)) != Some(value))
-        || !optional_tag_matches(
-            tag,
-            ItemKey::MusicBrainzArtistId,
-            patch.artist_mbid.as_ref(),
-        )
-        || !optional_tag_matches(
-            tag,
-            ItemKey::MusicBrainzReleaseId,
-            patch.release_mbid.as_ref(),
-        )
-        || !optional_tag_matches(
-            tag,
-            ItemKey::MusicBrainzReleaseGroupId,
-            patch.release_group_mbid.as_ref(),
-        )
-    {
-        bail!("Written extended tags did not match the reviewed values");
-    }
+    verify_tag(tag, patch)?;
     if artwork
         && !tag
             .pictures()
@@ -549,8 +535,43 @@ fn verify_patch(path: &Path, patch: &MetadataPatch, artwork: bool) -> Result<()>
     Ok(())
 }
 
-fn optional_tag_matches(tag: &Tag, key: ItemKey, expected: Option<&String>) -> bool {
-    expected.is_none_or(|value| tag.get_string(key) == Some(value.as_str()))
+fn verify_tag(tag: &Tag, patch: &MetadataPatch) -> Result<()> {
+    let recording_mbid = non_empty(Some(&patch.recording_mbid));
+    if tag.title().as_deref() != Some(patch.title.as_str())
+        || tag.artist().as_deref() != Some(patch.artist.as_str())
+        || tag.album().as_deref() != Some(patch.album.as_str())
+        || !optional_tag_matches(tag, ItemKey::MusicBrainzRecordingId, recording_mbid)
+    {
+        bail!("Written tags did not match the reviewed values");
+    }
+    let year = tag.date().map(|date| u32::from(date.year));
+    if tag.genre().as_deref() != non_empty(patch.genre.as_ref())
+        || tag.track() != patch.track_number
+        || tag.disk() != patch.disc_number
+        || year != patch.year
+        || !optional_tag_matches(
+            tag,
+            ItemKey::MusicBrainzArtistId,
+            non_empty(patch.artist_mbid.as_ref()),
+        )
+        || !optional_tag_matches(
+            tag,
+            ItemKey::MusicBrainzReleaseId,
+            non_empty(patch.release_mbid.as_ref()),
+        )
+        || !optional_tag_matches(
+            tag,
+            ItemKey::MusicBrainzReleaseGroupId,
+            non_empty(patch.release_group_mbid.as_ref()),
+        )
+    {
+        bail!("Written extended tags did not match the reviewed values");
+    }
+    Ok(())
+}
+
+fn optional_tag_matches(tag: &Tag, key: ItemKey, expected: Option<&str>) -> bool {
+    tag.get_string(key).as_deref() == expected
 }
 
 async fn fetch_cover_art(release_mbid: &str) -> Result<Vec<u8>> {
@@ -652,7 +673,7 @@ fn validate_patch(patch: &MetadataPatch) -> Result<()> {
     validate_text("title", &patch.title, 300)?;
     validate_text("artist", &patch.artist, 300)?;
     validate_text("album", &patch.album, 300)?;
-    if let Some(value) = patch.genre.as_deref() {
+    if let Some(value) = non_empty(patch.genre.as_ref()) {
         validate_text("genre", value, 150)?;
     }
     if patch
@@ -670,13 +691,15 @@ fn validate_patch(patch: &MetadataPatch) -> Result<()> {
     {
         bail!("track and disc numbers must be positive and bounded");
     }
-    validate_uuid("recordingMbid", &patch.recording_mbid)?;
+    if let Some(value) = non_empty(Some(&patch.recording_mbid)) {
+        validate_uuid("recordingMbid", value)?;
+    }
     for (name, value) in [
         ("artistMbid", patch.artist_mbid.as_deref()),
         ("releaseMbid", patch.release_mbid.as_deref()),
         ("releaseGroupMbid", patch.release_group_mbid.as_deref()),
     ] {
-        if let Some(value) = value {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
             validate_uuid(name, value)?;
         }
     }
@@ -771,6 +794,7 @@ fn sync_directory(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::tag::TagType;
 
     fn audit_fixture(root: &Path) -> LocalMetadataAuditTrack {
         let provider = LocalFolderProvider::from_root(root).unwrap();
@@ -804,6 +828,61 @@ mod tests {
             release_group_mbid: Some("9f32b6e4-f29d-43c7-9734-3a835a25fa36".into()),
             include_artwork: false,
         }
+    }
+
+    #[test]
+    fn metadata_patch_clears_stale_optional_tags_and_verifies_them() {
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Updated title".to_string());
+        tag.set_artist("Updated artist".to_string());
+        tag.set_album("Updated album".to_string());
+        tag.set_genre("Old genre".to_string());
+        tag.set_track(7);
+        tag.set_disk(2);
+        tag.insert_text(ItemKey::RecordingDate, "2001".to_string());
+        tag.insert_text(
+            ItemKey::MusicBrainzRecordingId,
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        );
+        tag.insert_text(
+            ItemKey::MusicBrainzArtistId,
+            "00000000-0000-0000-0000-000000000002".to_string(),
+        );
+        tag.insert_text(
+            ItemKey::MusicBrainzReleaseId,
+            "00000000-0000-0000-0000-000000000003".to_string(),
+        );
+        tag.insert_text(
+            ItemKey::MusicBrainzReleaseGroupId,
+            "00000000-0000-0000-0000-000000000004".to_string(),
+        );
+
+        let patch = MetadataPatch {
+            title: "Updated title".to_string(),
+            artist: "Updated artist".to_string(),
+            album: "Updated album".to_string(),
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            recording_mbid: String::new(),
+            artist_mbid: None,
+            release_mbid: None,
+            release_group_mbid: None,
+            include_artwork: false,
+        };
+
+        apply_patch_to_tag(&mut tag, &patch);
+
+        verify_tag(&tag, &patch).unwrap();
+        assert!(tag.genre().is_none());
+        assert!(tag.track().is_none());
+        assert!(tag.disk().is_none());
+        assert!(tag.date().is_none());
+        assert!(tag.get_string(ItemKey::MusicBrainzRecordingId).is_none());
+        assert!(tag.get_string(ItemKey::MusicBrainzArtistId).is_none());
+        assert!(tag.get_string(ItemKey::MusicBrainzReleaseId).is_none());
+        assert!(tag.get_string(ItemKey::MusicBrainzReleaseGroupId).is_none());
     }
 
     #[test]
