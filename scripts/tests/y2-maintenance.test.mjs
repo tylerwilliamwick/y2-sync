@@ -38,6 +38,7 @@ import {
   resolveContainedDirectory,
   reviewRange,
   retainExactStdout,
+  runManagedSubprocess,
   rustSourceContainsTests,
   sandboxPermissionOverride,
   scavengeAbandonedRunRoots,
@@ -48,7 +49,9 @@ import {
 } from "../y2-maintenance.mjs";
 import {
   buildMaintenancePlist,
+  installMaintenanceRuntime,
   maintenanceConfiguration,
+  maintenanceRuntimePaths,
   requireFullHistory,
   xmlEscape,
 } from "../install-y2-maintenance.mjs";
@@ -145,6 +148,61 @@ test("Node test discovery includes nested accepted regression tests", (t) => {
     join("scripts", "tests", "root.test.mjs"),
   ]);
 });
+
+test(
+  "managed subprocess timeouts terminate descendant process groups",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const fixture = mkdtempSync(join(tmpdir(), "y2-managed-process-"));
+    const scriptPath = join(fixture, "process-tree.mjs");
+    const pidPath = join(fixture, "pids.json");
+    let observedPids = [];
+    t.after(() => {
+      for (const pid of observedPids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          if (error?.code !== "ESRCH") throw error;
+        }
+      }
+      rmSync(fixture, { recursive: true, force: true });
+    });
+    writeFileSync(
+      scriptPath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        'const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+        "writeFileSync(process.argv[2], JSON.stringify([process.pid, child.pid]));",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    assert.equal(
+      await runManagedSubprocess([
+        "1000",
+        process.execPath,
+        scriptPath,
+        pidPath,
+      ]),
+      124,
+    );
+    observedPids = JSON.parse(readFileSync(pidPath, "utf8"));
+    const processExists = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        if (error?.code === "ESRCH") return false;
+        throw error;
+      }
+    };
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (observedPids.every((pid) => !processExists(pid))) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    }
+    assert.ok(observedPids.every((pid) => !processExists(pid)));
+  },
+);
 
 test("abandoned run cleanup is isolated by maintenance state directory", (t) => {
   const fixture = mkdtempSync(join(tmpdir(), "y2-maintenance-recovery-"));
@@ -346,9 +404,7 @@ test("sandbox profiles deny the user home and grant only explicit maintenance ro
     network: false,
   });
   assert.ok(profile.includes(`${JSON.stringify(home)}="deny"`));
-  assert.ok(
-    profile.includes(`${JSON.stringify(realpathSync(home))}="deny"`),
-  );
+  assert.ok(profile.includes(`${JSON.stringify(realpathSync(home))}="deny"`));
   assert.ok(profile.includes(`${JSON.stringify(resolve(tmpdir()))}="read"`));
   assert.ok(profile.includes(`${JSON.stringify(workspace)}="write"`));
   assert.ok(
@@ -873,11 +929,7 @@ test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependenc
   );
   const audioFetch = plan.find((gate) => gate.id === "audio-source-fetch");
   assert.equal(audioFetch.network, true);
-  assert.deepEqual(audioFetch.args.slice(0, 3), [
-    "proxy",
-    "curl",
-    "--disable",
-  ]);
+  assert.deepEqual(audioFetch.args.slice(0, 3), ["proxy", "curl", "--disable"]);
   assert.ok(
     audioFetch.args.includes("https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"),
   );
@@ -897,8 +949,10 @@ test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependenc
     assert.equal(plan.find((gate) => gate.id === id).localNetwork, true);
   }
   for (const id of ["daemon-check", "daemon-tests", "support-tests"]) {
-    assert.equal(plan.find((gate) => gate.id === id).cargoOffline, true);
-    assert.notEqual(plan.find((gate) => gate.id === id).network, true);
+    const gate = plan.find((candidate) => candidate.id === id);
+    assert.equal(gate.cargoOffline, true);
+    assert.equal(gate.timeoutMs, 45 * 60 * 1000);
+    assert.notEqual(gate.network, true);
   }
   assert.ok(
     plan.every((gate) => Array.isArray(gate.args) && gate.args.length > 1),
@@ -918,13 +972,21 @@ test("launchd configuration uses fixed arguments, least-privilege files, and no 
     stateDir: join(fixtureRoot, "state"),
     cacheDir: join(fixtureRoot, "cache"),
   });
-  const plist = buildMaintenancePlist(configuration, { intervalSeconds: 3600 });
+  const runtime = maintenanceRuntimePaths(
+    configuration.stateDir,
+    "a".repeat(64),
+  );
+  const plist = buildMaintenancePlist(configuration, {
+    intervalSeconds: 3600,
+    runnerPath: runtime.runner,
+  });
   assert.match(plist, /<integer>3600<\/integer>/);
   assert.match(plist, /Y2 &amp; Sync/);
   assert.ok(plist.includes(xmlEscape(configuration.gitWatchPath)));
   assert.ok(plist.includes(xmlEscape(configuration.nodePath)));
+  assert.ok(plist.includes(xmlEscape(runtime.runner)));
   assert.ok(
-    plist.includes(
+    !plist.includes(
       xmlEscape(join(configuration.repoPath, "scripts", "y2-maintenance.mjs")),
     ),
   );
@@ -935,10 +997,84 @@ test("launchd configuration uses fixed arguments, least-privilege files, and no 
   assert.doesNotMatch(plist, /KeepAlive/);
   assert.equal(xmlEscape("<&\"'>"), "&lt;&amp;&quot;&apos;&gt;");
   assert.throws(
+    () => buildMaintenancePlist(configuration),
+    /installed maintenance runner path/,
+  );
+  assert.throws(
     () => buildMaintenancePlist(configuration, { intervalSeconds: 60 }),
     /at least 900/,
   );
 });
+
+test("maintenance runtime installation copies reviewed code outside the worktree", (t) => {
+  const fixture = realpathSync(
+    mkdtempSync(join(tmpdir(), "y2-installed-runtime-")),
+  );
+  t.after(() => rmSync(fixture, { recursive: true, force: true }));
+  const repository = join(fixture, "repo");
+  const scripts = join(repository, "scripts");
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(join(scripts, "y2-maintenance.mjs"), "first runner\n");
+  writeFileSync(join(scripts, "maintenance-review.schema.json"), "{}\n");
+  const configuration = maintenanceConfiguration({
+    repoPath: repository,
+    rtkPath: process.execPath,
+    codexPath: process.execPath,
+    nodePath: process.execPath,
+    repoSlug: "owner/repo",
+    originUrl: "https://github.com/owner/repo.git",
+    stateDir: join(fixture, "state"),
+    cacheDir: join(fixture, "cache"),
+  });
+  const first = installMaintenanceRuntime(configuration);
+  assert.equal(readFileSync(first.runner, "utf8"), "first runner\n");
+  assert.equal(readFileSync(first.schema, "utf8"), "{}\n");
+  assert.deepEqual(installMaintenanceRuntime(configuration), first);
+  writeFileSync(join(scripts, "y2-maintenance.mjs"), "second runner\n");
+  const second = installMaintenanceRuntime(configuration);
+  assert.notEqual(second.bundle, first.bundle);
+  assert.equal(readFileSync(first.runner, "utf8"), "first runner\n");
+  assert.equal(readFileSync(second.runner, "utf8"), "second runner\n");
+  assert.equal(
+    JSON.parse(readFileSync(second.pointer, "utf8")).digest,
+    second.bundle.split(sep).at(-1),
+  );
+  assert.ok(!second.runner.startsWith(`${configuration.repoPath}${sep}`));
+});
+
+test(
+  "maintenance runtime installation rejects a symlinked state directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const fixture = realpathSync(
+      mkdtempSync(join(tmpdir(), "y2-runtime-symlink-")),
+    );
+    t.after(() => rmSync(fixture, { recursive: true, force: true }));
+    const scripts = join(fixture, "repo", "scripts");
+    const target = join(fixture, "state-target");
+    const stateDir = join(fixture, "state-link");
+    mkdirSync(scripts, { recursive: true });
+    mkdirSync(target);
+    writeFileSync(join(scripts, "y2-maintenance.mjs"), "runner\n");
+    writeFileSync(join(scripts, "maintenance-review.schema.json"), "{}\n");
+    symlinkSync(target, stateDir, "dir");
+    assert.throws(
+      () =>
+        installMaintenanceRuntime(
+          maintenanceConfiguration({
+            repoPath: join(fixture, "repo"),
+            rtkPath: process.execPath,
+            codexPath: process.execPath,
+            repoSlug: "owner/repo",
+            originUrl: "https://github.com/owner/repo.git",
+            stateDir,
+            cacheDir: join(fixture, "cache"),
+          }),
+        ),
+      /symbolic link/,
+    );
+  },
+);
 
 test("scheduled installation requires a full-history repository", () => {
   assert.doesNotThrow(() => requireFullHistory("false\n"));

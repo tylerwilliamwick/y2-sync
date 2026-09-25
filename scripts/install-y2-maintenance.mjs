@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   defaultCacheDir,
@@ -32,6 +35,20 @@ export const maintenancePlistPath = join(
 );
 export const maintenanceConfigPath = join(defaultStateDir, "config.json");
 const launchDomain = `gui/${process.getuid?.() ?? -1}`;
+const maintenanceRuntimePointerName = "runtime.json";
+export function maintenanceRuntimePaths(stateDir, digest) {
+  if (!/^[a-f0-9]{64}$/.test(digest ?? ""))
+    throw new Error("maintenance runtime digest is invalid");
+  const root = join(resolve(stateDir), "runtime");
+  const bundle = join(root, "versions", digest);
+  return {
+    root,
+    bundle,
+    pointer: join(resolve(stateDir), maintenanceRuntimePointerName),
+    runner: join(bundle, "scripts", "y2-maintenance.mjs"),
+    schema: join(bundle, "scripts", "maintenance-review.schema.json"),
+  };
+}
 
 export function xmlEscape(value) {
   return String(value)
@@ -137,6 +154,11 @@ export function buildMaintenancePlist(configuration, options = {}) {
       "maintenance interval must be an integer of at least 900 seconds",
     );
   }
+  const runnerPath = resolve(options.runnerPath ?? "");
+  const runtimeRoot = join(resolve(configuration.stateDir), "runtime");
+  if (!options.runnerPath || !runnerPath.startsWith(`${runtimeRoot}${sep}`)) {
+    throw new Error("installed maintenance runner path is invalid");
+  }
   const pathEntries = [
     dirname(configuration.nodePath),
     dirname(configuration.rtkPath),
@@ -156,11 +178,7 @@ export function buildMaintenancePlist(configuration, options = {}) {
   const values = {
     label: maintenanceLabel,
     node: configuration.nodePath,
-    runner: join(
-      resolve(configuration.repoPath),
-      "scripts",
-      "y2-maintenance.mjs",
-    ),
+    runner: runnerPath,
     config: maintenanceConfigPath,
     cwd: configuration.repoPath,
     path: executablePath,
@@ -217,6 +235,156 @@ export function buildMaintenancePlist(configuration, options = {}) {
 `;
 }
 
+export function installMaintenanceRuntime(configuration) {
+  const sources = [
+    {
+      source: join(
+        resolve(configuration.repoPath),
+        "scripts",
+        "y2-maintenance.mjs",
+      ),
+      name: "y2-maintenance.mjs",
+    },
+    {
+      source: join(
+        resolve(configuration.repoPath),
+        "scripts",
+        "maintenance-review.schema.json",
+      ),
+      name: "maintenance-review.schema.json",
+    },
+  ];
+  const contents = sources.map(({ source, name }) => {
+    const metadata = lstatSync(source);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(
+        `maintenance runtime source is not a regular file: ${source}`,
+      );
+    }
+    return { name, value: readFileSync(source) };
+  });
+  const digestHash = createHash("sha256");
+  for (const { name, value } of contents) {
+    digestHash.update(`${name}\0${value.length}\0`);
+    digestHash.update(value);
+  }
+  const digest = digestHash.digest("hex");
+  const paths = maintenanceRuntimePaths(configuration.stateDir, digest);
+  const versionsRoot = dirname(paths.bundle);
+  const stagingRoot = join(
+    versionsRoot,
+    `.tmp-${process.pid}-${digest.slice(0, 12)}`,
+  );
+  mkdirSync(configuration.stateDir, { recursive: true, mode: 0o700 });
+  const stateMetadata = lstatSync(configuration.stateDir);
+  if (
+    !stateMetadata.isDirectory() ||
+    stateMetadata.isSymbolicLink() ||
+    resolve(realpathSync(configuration.stateDir)) !==
+      resolve(configuration.stateDir)
+  ) {
+    throw new Error("maintenance state directory cannot be a symbolic link");
+  }
+  chmodSync(configuration.stateDir, 0o700);
+  for (const directory of [paths.root, versionsRoot]) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("maintenance runtime path cannot contain symbolic links");
+    }
+    chmodSync(directory, 0o700);
+  }
+  rmSync(stagingRoot, { recursive: true, force: true });
+  mkdirSync(join(stagingRoot, "scripts"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  for (const { name, value } of contents) {
+    const destination = join(stagingRoot, "scripts", name);
+    writeFileSync(destination, value, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    chmodSync(destination, 0o600);
+  }
+  if (!existsSync(paths.bundle)) {
+    renameSync(stagingRoot, paths.bundle);
+  } else {
+    const metadata = lstatSync(paths.bundle);
+    rmSync(stagingRoot, { recursive: true, force: true });
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("installed maintenance runtime bundle is invalid");
+    }
+  }
+  for (const directory of [paths.bundle, dirname(paths.runner)]) {
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("installed maintenance runtime bundle is invalid");
+    }
+  }
+  for (const { name, value } of contents) {
+    const installedPath = join(paths.bundle, "scripts", name);
+    const metadata = lstatSync(installedPath);
+    if (
+      !metadata.isFile() ||
+      metadata.isSymbolicLink() ||
+      !readFileSync(installedPath).equals(value)
+    ) {
+      throw new Error("installed maintenance runtime bundle failed validation");
+    }
+  }
+  const temporaryPointer = `${paths.pointer}.tmp-${process.pid}`;
+  rmSync(temporaryPointer, { force: true });
+  writeFileSync(
+    temporaryPointer,
+    `${JSON.stringify({ schemaVersion: maintenanceSchemaVersion, digest }, null, 2)}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 },
+  );
+  chmodSync(temporaryPointer, 0o600);
+  renameSync(temporaryPointer, paths.pointer);
+  chmodSync(paths.pointer, 0o600);
+  return paths;
+}
+
+function readInstalledRuntime(stateDir) {
+  const pointer = join(resolve(stateDir), maintenanceRuntimePointerName);
+  const metadata = lstatSync(pointer);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("installed maintenance runtime pointer is invalid");
+  }
+  const value = JSON.parse(readFileSync(pointer, "utf8"));
+  if (
+    value?.schemaVersion !== maintenanceSchemaVersion ||
+    Object.keys(value).sort().join(",") !== "digest,schemaVersion"
+  ) {
+    throw new Error("installed maintenance runtime pointer is invalid");
+  }
+  const paths = maintenanceRuntimePaths(stateDir, value.digest);
+  for (const directory of [
+    paths.root,
+    dirname(paths.bundle),
+    paths.bundle,
+    dirname(paths.runner),
+  ]) {
+    const directoryMetadata = lstatSync(directory);
+    if (
+      !directoryMetadata.isDirectory() ||
+      directoryMetadata.isSymbolicLink()
+    ) {
+      throw new Error(
+        "installed maintenance runtime is unavailable; reinstall it",
+      );
+    }
+  }
+  const runnerMetadata = lstatSync(paths.runner);
+  if (!runnerMetadata.isFile() || runnerMetadata.isSymbolicLink()) {
+    throw new Error(
+      "installed maintenance runtime is unavailable; reinstall it",
+    );
+  }
+  return paths;
+}
+
 function writeConfiguration(configuration) {
   mkdirSync(configuration.stateDir, { recursive: true, mode: 0o700 });
   chmodSync(configuration.stateDir, 0o700);
@@ -256,16 +424,6 @@ function install(repoPath) {
     originUrl: repository.url,
     gitWatchPath: repository.gitWatchPath,
   });
-  writeConfiguration(configuration);
-  mkdirSync(launchAgentsDir, { recursive: true, mode: 0o755 });
-  writeFileSync(maintenancePlistPath, buildMaintenancePlist(configuration), {
-    encoding: "utf8",
-    mode: 0o644,
-  });
-  chmodSync(maintenancePlistPath, 0o644);
-  run(rtkPath, ["proxy", "plutil", "-lint", maintenancePlistPath], {
-    check: true,
-  });
   run(rtkPath, [
     "proxy",
     "launchctl",
@@ -273,6 +431,18 @@ function install(repoPath) {
     launchDomain,
     maintenancePlistPath,
   ]);
+  const runtime = installMaintenanceRuntime(configuration);
+  writeConfiguration(configuration);
+  mkdirSync(launchAgentsDir, { recursive: true, mode: 0o755 });
+  writeFileSync(
+    maintenancePlistPath,
+    buildMaintenancePlist(configuration, { runnerPath: runtime.runner }),
+    { encoding: "utf8", mode: 0o644 },
+  );
+  chmodSync(maintenancePlistPath, 0o644);
+  run(rtkPath, ["proxy", "plutil", "-lint", maintenancePlistPath], {
+    check: true,
+  });
   run(
     rtkPath,
     ["proxy", "launchctl", "bootstrap", launchDomain, maintenancePlistPath],
@@ -301,6 +471,8 @@ function uninstall() {
   ]);
   rmSync(maintenancePlistPath, { force: true });
   rmSync(maintenanceConfigPath, { force: true });
+  rmSync(join(defaultStateDir, "runtime"), { recursive: true, force: true });
+  rmSync(join(defaultStateDir, maintenanceRuntimePointerName), { force: true });
   console.log(
     `Uninstalled ${maintenanceLabel}. Existing maintenance reports were retained.`,
   );
@@ -325,12 +497,13 @@ function runNow(extraArgs) {
   if (!existsSync(maintenanceConfigPath))
     throw new Error("install the maintenance agent before running it");
   const configuration = JSON.parse(readFileSync(maintenanceConfigPath, "utf8"));
+  const runtime = readInstalledRuntime(configuration.stateDir);
   const result = run(
     configuration.rtkPath,
     [
       "proxy",
       configuration.nodePath,
-      join(configuration.repoPath, "scripts", "y2-maintenance.mjs"),
+      runtime.runner,
       "--config",
       maintenanceConfigPath,
       ...extraArgs,

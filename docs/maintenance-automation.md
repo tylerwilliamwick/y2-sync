@@ -5,6 +5,7 @@ Y2 Sync includes an opt-in macOS LaunchAgent that audits the tracked upstream ti
 ## Safety contract
 
 - The operator worktree is never edited. Each run requires an explicit `origin/*` upstream and uses separate disposable, no-hardlink clones pinned to that commit SHA for initial gates, review/remediation, and final validation. Gate side effects are discarded before review or repair.
+- Installation atomically snapshots the reviewed runner and its JSON schema into the private maintenance state directory. Scheduled and manual runs execute that installed copy, so checking out another branch cannot replace the pre-sandbox launcher.
 - Fixed deterministic gates run before any model review: formatting, Node/Python regressions, UI build, locally generated audio fixtures, locked Rust dependency prefetch, canonical FFmpeg source download plus offline checksum verification, offline daemon check/tests, support-crate tests, and production-dependency audit.
 - Every model tool and quality gate runs under a macOS Seatbelt profile. The user home is denied except for explicit toolchain paths, and broad temporary roots are read-only except for disposable clones, isolated scratch space, and bounded caches. External network access is enabled only for dependency acquisition and audit. Repository Rust code compiles and tests with Cargo's offline mode enforced; only Cargo's two advisory lock files remain writable in the otherwise read-only dependency cache. Native tests may bind loopback mock servers through Codex's default-deny managed network; a preceding probe requires loopback success and an HTTP 403 for external egress.
 - Codex first reviews with read-only workspace access. Remediation uses workspace-write access with approvals disabled, no Git/GitHub credential configuration, and a sanitized environment that excludes tokens, secrets, and agent sockets.
@@ -14,11 +15,11 @@ Y2 Sync includes an opt-in macOS LaunchAgent that audits the tracked upstream ti
 - Successful fixes are committed to a timestamped `automation/maintenance-*` branch and opened as a **draft** pull request. Drafts do not execute repository code in CI; a maintainer must mark the pull request ready first. The automation never merges, force-pushes, publishes, signs, or modifies repository settings.
 - Bounded JSON reports and redacted logs are stored with mode `0600` under `~/Library/Application Support/Y2 Sync Maintenance`. Recoverable dependency caches and disposable clones live only in separate mode-`0700` directories beneath the macOS per-user temporary directory, so build tools never need access to the denied home directory. Only the latest 30 reports are retained.
 - Dirty local edits are detected and recorded but never copied, reviewed, or changed.
-- A kernel-backed macOS `lockf` lock covers each whole run. The kernel releases it on exit or crash, and overlapping manual or scheduled invocations exit cleanly. Disposable clones use a state-scoped temporary namespace; after an unclean exit, the next lock holder removes every abandoned clone in that namespace and finalizes reports left `running` before starting new work.
+- A kernel-backed macOS `lockf` lock covers each whole run. The kernel releases it on exit or crash, and overlapping manual or scheduled invocations exit cleanly. Each bounded command owns a separate process group so a timeout terminates descendants before the run proceeds. Disposable clones use a state-scoped temporary namespace; after an unclean exit, the next lock holder removes every abandoned clone in that namespace and finalizes reports left `running` before starting new work.
 
 ## Commands
 
-Installation requires a full-history (non-shallow) Git clone so every reviewed range is complete.
+Installation requires a full-history (non-shallow) Git clone so every reviewed range is complete. Re-run `maintenance:install` after updating the automation to install the newly reviewed runner snapshot.
 
 ```bash
 rtk npm run maintenance:install

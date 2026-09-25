@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -38,8 +38,12 @@ const reviewSchemaPath = join(
 const maxCommandOutput = 96 * 1024;
 const maxReviewBytes = 256 * 1024;
 const defaultCommandTimeoutMs = 30 * 60 * 1000;
+const longBuildTimeoutMs = 45 * 60 * 1000;
 const codexTimeoutMs = 45 * 60 * 1000;
 const nativeLockMarker = "--native-lock-held";
+const managedSubprocessMarker = "--managed-subprocess";
+const managedSubprocessGraceMs = 15_000;
+const managedSubprocessKillGraceMs = 5_000;
 const verifySha256Program = [
   'const { createHash } = require("node:crypto");',
   'const { readFileSync, statSync } = require("node:fs");',
@@ -479,10 +483,133 @@ export function retainExactStdout(record, stdout) {
   return record;
 }
 
+function terminateManagedProcessTree(pid, signal) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  if (process.platform === "win32") {
+    const result = spawnSync(
+      "taskkill.exe",
+      ["/pid", String(pid), "/t", "/f"],
+      { stdio: "ignore", windowsHide: true },
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      try {
+        process.kill(pid, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") return;
+        throw error;
+      }
+      throw new Error(`taskkill failed with exit code ${result.status}`);
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
+export function runManagedSubprocess(argv) {
+  const [timeoutValue, requestedExecutable, ...args] = argv;
+  const timeoutMs = Number(timeoutValue);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)
+    throw new Error("managed subprocess timeout is invalid");
+  if (!requestedExecutable || args.length === 0)
+    throw new Error("managed subprocess command is incomplete");
+  const executable = resolveApprovedExecutable("rtk", requestedExecutable);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(executable, args, {
+      detached: process.platform !== "win32",
+      env: process.env,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    let timedOut = false;
+    let settled = false;
+    let childExited = false;
+    let childCode = 1;
+    let terminationError = null;
+    let timeoutHandle;
+    let forceHandle;
+    let pollHandle;
+    const cleanup = () => {
+      clearTimeout(timeoutHandle);
+      clearTimeout(forceHandle);
+      clearInterval(pollHandle);
+      process.off("SIGINT", terminate);
+      process.off("SIGTERM", terminate);
+    };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const processGroupExists = () => {
+      if (process.platform === "win32") return false;
+      try {
+        process.kill(-child.pid, 0);
+        return true;
+      } catch (error) {
+        if (error?.code === "ESRCH") return false;
+        if (error?.code === "EPERM") return true;
+        throw error;
+      }
+    };
+    const finishWhenStopped = () => {
+      if (!childExited) return;
+      if (!timedOut) {
+        settle(resolvePromise, childCode);
+      } else if (!processGroupExists()) {
+        if (terminationError) settle(rejectPromise, terminationError);
+        else settle(resolvePromise, 124);
+      }
+    };
+    const terminate = () => {
+      if (timedOut) return;
+      timedOut = true;
+      try {
+        terminateManagedProcessTree(child.pid, "SIGTERM");
+      } catch (error) {
+        terminationError = error;
+        child.kill("SIGTERM");
+        console.error(
+          `managed process termination failed: ${safeError(error)}`,
+        );
+      }
+      pollHandle = setInterval(finishWhenStopped, 50);
+      forceHandle = setTimeout(() => {
+        try {
+          terminateManagedProcessTree(child.pid, "SIGKILL");
+        } catch (error) {
+          terminationError ??= error;
+          child.kill("SIGKILL");
+          console.error(`managed process kill failed: ${safeError(error)}`);
+        }
+        finishWhenStopped();
+      }, managedSubprocessKillGraceMs);
+      finishWhenStopped();
+    };
+    process.once("SIGINT", terminate);
+    process.once("SIGTERM", terminate);
+    child.once("error", (error) => {
+      settle(rejectPromise, error);
+    });
+    child.once("exit", (code) => {
+      childExited = true;
+      childCode = Number.isInteger(code) ? code : 1;
+      finishWhenStopped();
+    });
+    timeoutHandle = setTimeout(terminate, timeoutMs);
+  });
+}
+
 function runRtk(configuration, args, options = {}) {
   const started = Date.now();
   const command = commandString([configuration.rtkPath, ...args]);
   appendLog(options.logPath, `$ ${command}`);
+  const timeoutMs = options.timeoutMs ?? defaultCommandTimeoutMs;
   const environment = sanitizedEnvironment(options.env, {
     allowCredentials: options.allowCredentials,
   });
@@ -492,20 +619,34 @@ function runRtk(configuration, args, options = {}) {
     }
     environment[key] = value;
   }
-  const result = spawnSync(configuration.rtkPath, args, {
-    cwd: options.cwd ?? configuration.repoPath,
-    encoding: "utf8",
-    env: environment,
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: options.timeoutMs ?? defaultCommandTimeoutMs,
-  });
+  const result = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(import.meta.url),
+      managedSubprocessMarker,
+      String(timeoutMs),
+      configuration.rtkPath,
+      ...args,
+    ],
+    {
+      cwd: options.cwd ?? configuration.repoPath,
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: timeoutMs + managedSubprocessGraceMs,
+      killSignal: "SIGKILL",
+    },
+  );
   const stdout = outputTail(result.stdout);
   const stderr = outputTail(result.stderr);
   if (options.logOutput !== false) {
     if (stdout) appendLog(options.logPath, stdout);
     if (stderr) appendLog(options.logPath, stderr);
   }
-  const timedOut = Boolean(result.error && result.error.code === "ETIMEDOUT");
+  const timedOut = Boolean(
+    result.status === 124 ||
+    (result.error && result.error.code === "ETIMEDOUT"),
+  );
   const code = Number.isInteger(result.status)
     ? result.status
     : timedOut
@@ -823,7 +964,7 @@ export function sandboxPermissionOverride({
 }
 
 export function gateEnvironment(configuration) {
-  const scratchDir = mkdtempSync(join("/tmp", "y2m-"));
+  const scratchDir = mkdtempSync(join(tmpdir(), "y2m-"));
   const toolCacheDir = join(configuration.cacheDir, "tooling");
   const home = join(scratchDir, "home");
   const temporary = join(scratchDir, "tmp");
@@ -994,6 +1135,7 @@ export function maintenanceGatePlan(workspace) {
         "hifimule-daemon",
       ],
       cargoOffline: true,
+      timeoutMs: longBuildTimeoutMs,
     },
     {
       id: "local-network-probe",
@@ -1013,6 +1155,7 @@ export function maintenanceGatePlan(workspace) {
       ],
       cargoOffline: true,
       localNetwork: true,
+      timeoutMs: longBuildTimeoutMs,
     },
     {
       id: "support-tests",
@@ -1029,6 +1172,7 @@ export function maintenanceGatePlan(workspace) {
       ],
       cargoOffline: true,
       localNetwork: true,
+      timeoutMs: longBuildTimeoutMs,
     },
   ];
 }
@@ -1080,6 +1224,7 @@ function runGates(configuration, workspace, logPath, options = {}) {
             ? { ...environment, CARGO_NET_OFFLINE: "true" }
             : environment,
           logPath,
+          timeoutMs: gate.timeoutMs,
         },
       );
       results.push({ id: gate.id, ...result });
@@ -2328,9 +2473,11 @@ if (
   try {
     const argv = process.argv.slice(2);
     process.exitCode =
-      argv[0] === nativeLockMarker
-        ? runMaintenance(argv.slice(2), argv[1])
-        : runMaintenanceWithLock(argv);
+      argv[0] === managedSubprocessMarker
+        ? await runManagedSubprocess(argv.slice(1))
+        : argv[0] === nativeLockMarker
+          ? runMaintenance(argv.slice(2), argv[1])
+          : runMaintenanceWithLock(argv);
   } catch (error) {
     console.error(`Y2 maintenance could not start: ${safeError(error)}`);
     process.exitCode = 1;
