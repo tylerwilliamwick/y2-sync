@@ -319,16 +319,22 @@ test("sensitive environment values and common token shapes are removed from repo
   assert.equal(authenticated.GIT_CONFIG_GLOBAL, undefined);
 });
 
-test("sandbox profiles deny the user home and grant only explicit maintenance roots", () => {
+test("sandbox profiles deny the user home and grant only explicit maintenance roots", (t) => {
   assert.equal(defaultCacheDir, join(tmpdir(), "Y2SyncMaintenanceTooling"));
   const home = resolve(homedir());
-  const fixtureRoot = join(tmpdir(), "y2-maintenance-profile-fixture");
+  const fixtureRoot = mkdtempSync(
+    join(tmpdir(), "y2-maintenance-profile-fixture-"),
+  );
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
   const workspace = join(fixtureRoot, "workspace");
   const scratchDir = join(fixtureRoot, "scratch");
   const localBin = join(fixtureRoot, ".local", "bin");
   const rtkPath = join(localBin, "rtk");
   const codexPath = join(localBin, "codex");
   const toolCacheDir = join(fixtureRoot, "cache");
+  mkdirSync(localBin, { recursive: true });
+  writeFileSync(rtkPath, "");
+  writeFileSync(codexPath, "");
   const profile = sandboxPermissionOverride({
     profileName: "test-profile",
     workspace,
