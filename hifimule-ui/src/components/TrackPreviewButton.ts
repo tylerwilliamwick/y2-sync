@@ -6,7 +6,7 @@ export function createTrackPreviewButton(
     serverId: string | null | undefined,
     trackId: string,
     title: string,
-    supportsPlayback = false,
+    supportsPlayback = true,
 ): HTMLElement {
     const button = document.createElement('sl-icon-button') as any;
     const source = supportsPlayback && serverId ? { serverId, trackId } : null;

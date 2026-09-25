@@ -50,7 +50,7 @@ export class MediaCard {
         deviceSelectionEnabled?: boolean,
         supportsPlaylistWrite?: boolean,
         onCurate?: (id: string, name: string) => void,
-        supportsPlayback = false,
+        supportsPlayback = true,
     ): HTMLElement {
         const isBrowseItem = !('Id' in item);
         const itemId = isBrowseItem ? ((item as BrowseDisplayItem).basketId ?? (item as BrowseDisplayItem).id) : (item as JellyfinItem | JellyfinView).Id;

@@ -2,7 +2,7 @@ import { playbackPlayAlbum } from '../rpc';
 import { t } from '../i18n';
 import { showToast } from '../toast';
 
-export function createAlbumPlayButton(albumId: string, serverId: string | undefined, title: string, kind: 'album' | 'book' = 'album', supportsPlayback = false): HTMLElement & { disabled: boolean } {
+export function createAlbumPlayButton(albumId: string, serverId: string | undefined, title: string, kind: 'album' | 'book' = 'album', supportsPlayback = true): HTMLElement & { disabled: boolean } {
     const play = document.createElement('sl-icon-button') as HTMLElement & { name: string; label: string; disabled: boolean };
     play.name = 'play-fill';
     play.label = t(kind === 'book' ? 'library.books.play_book' : 'playback.play_album', { title });

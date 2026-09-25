@@ -83,7 +83,7 @@ export class TracksBrowseView {
     private selectionAnchorIdx: number | null = null;
     private _escapeHandler: ((e: KeyboardEvent) => void) | null = null;
 
-    constructor(container: HTMLElement, supportsPlaylistWrite = false, supportsPlayback = false) {
+    constructor(container: HTMLElement, supportsPlaylistWrite = false, supportsPlayback = true) {
         this.container = container;
         this.supportsPlaylistWrite = supportsPlaylistWrite;
         this.supportsPlayback = supportsPlayback;
