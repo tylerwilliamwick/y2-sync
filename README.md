@@ -15,6 +15,9 @@ HifiMule is a desktop application that bridges open source media servers and por
 ## Features
 
 - **Multi-server hub** — Connect several media servers (any mix of Jellyfin, Subsonic, and Navidrome), name them, give them custom icons, and switch with a click. Your basket can hold music from multiple servers at once, syncing each item back to where it came from.
+- **Local music folders** — Add an owned-music folder as a read-only browse and sync source; symlinks are never followed and full local paths stay out of the UI.
+- **Reviewed metadata cleanup** — Audit embedded tags and artwork, compare scored MusicBrainz candidates, and write only after explicit review. Writes are stale-safe, verified, and retain the original as a hidden backup.
+- **Algorithmic local playlists** — Preview deterministic Discovery, Weekly, and Daily mixes, or import ListenBrainz Weekly Exploration, Weekly Jams, and Daily Jams. Imports match owned files and report missing recommendations; they never download audio.
 - **Rich library browsing** — Nine browse modes: Artists, Albums, Playlists, Tracks, Genres, Recently Added, Frequently Played, Recently Played, and Favorites. Switch between grid and list views with an A–Z jump strip for large collections.
 - **Built-in audio playback** — Play albums directly from your media server on your computer, with pause/resume, previous/next, seeking, and audio output selection.
 - **Track previews** — Preview a track while browsing, then return to your listening session.
@@ -181,13 +184,15 @@ HifiMule/
 
 ## How It Works
 
-1. **Connect** — Add one or more media servers (Jellyfin, Navidrome, or any Subsonic-compatible server) in the Server Hub and log in
+1. **Connect** — Add one or more media servers (Jellyfin, Navidrome, or any Subsonic-compatible server), or choose a local music folder
 2. **Browse** — Navigate your library across nine browse modes, switching servers as you go
 3. **Play** — Start an album or preview a track directly in HifiMule; use the playback controls and queue to manage your listening session
 4. **Select** — Add items to the sync basket — one at a time, in bulk, or automatically with auto-fill
 5. **Plug in** — Connect your portable device, initialize it, and configure its folders and transcoding profile
 6. **Sync** — HifiMule calculates deltas and transfers only what's needed; syncs can resume or be cancelled
 7. **Listen on the go** — Play music on your device; scrobble logs sync back to your media server
+
+For a selected local folder, open **Server Hub → Library tools** to audit metadata or preview and create relative UTF-8 playlists. Metadata changes always require choosing a MusicBrainz candidate and checking the review confirmation first.
 
 ### Listening in HifiMule
 

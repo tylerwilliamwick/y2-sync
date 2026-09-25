@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
 
 use crate::device::{DeviceManifest, SyncedItem};
-use crate::providers::{MediaProvider, TranscodeProfile};
+use crate::providers::{MediaProvider, TranscodeProfile, TransferSource};
 
 pub const DESTRUCTIVE_CLEANUP_THRESHOLD: usize = 25;
 const MAX_FILE_BUFFER_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB hard cap
@@ -46,6 +46,14 @@ fn transfer_timing(size_bytes: u64, elapsed: Duration) -> TransferTiming {
 struct TransferTotals {
     bytes: u64,
     elapsed: Duration,
+}
+
+enum OpenedTransferSource {
+    Http {
+        url: String,
+        response: reqwest::Response,
+    },
+    LocalFile(std::path::PathBuf),
 }
 
 impl TransferTotals {
@@ -2545,7 +2553,7 @@ pub async fn execute_provider_sync(
                 None
             };
             crate::daemon_log!(
-                "[Sync] Preparing '{}': resolving provider download URL (transcode={}, source_suffix={:?}, source_content_type={:?}, direct_compatible={}, preferred_audio_container={:?}, device_preferred_audio_container={:?})",
+                "[Sync] Preparing '{}': resolving provider transfer source (transcode={}, source_suffix={:?}, source_content_type={:?}, direct_compatible={}, preferred_audio_container={:?}, device_preferred_audio_container={:?})",
                 add_item.name,
                 profile.is_some(),
                 add_item.provider_suffix,
@@ -2554,24 +2562,24 @@ pub async fn execute_provider_sync(
                 preferred_audio_container,
                 device_preferred_audio_container
             );
-            let url_result = tokio::select! {
+            let source_result = tokio::select! {
                 result = async {
-                    match producer_provider.download_url(&add_item.jellyfin_id, profile.as_ref()).await {
-                        Ok(url) => Ok(url),
+                    match producer_provider.transfer_source(&add_item.jellyfin_id, profile.as_ref()).await {
+                        Ok(source) => Ok(source),
                         Err(first_error) => {
                             crate::daemon_log!(
-                                "[Sync] Retrying source URL for '{}': {}",
+                                "[Sync] Retrying transfer source for '{}': {}",
                                 add_item.name,
                                 first_error
                             );
-                            producer_provider.download_url(&add_item.jellyfin_id, profile.as_ref()).await
+                            producer_provider.transfer_source(&add_item.jellyfin_id, profile.as_ref()).await
                         }
                     }
                 } => result,
                 _ = wait_for_operation_cancellation(&producer_operation_manager, &producer_operation_id) => break,
             };
-            let url = match url_result {
-                Ok(url) => url,
+            let transfer_source = match source_result {
+                Ok(source) => source,
                 Err(e) => {
                     if profile.is_some() {
                         warnings.push(format!(
@@ -2609,84 +2617,98 @@ pub async fn execute_provider_sync(
                     continue;
                 }
             };
-            crate::daemon_log!("[Sync] Preparing '{}': opening HTTP stream", add_item.name);
-            let response_result = tokio::select! {
-                result = async {
-                    let client = reqwest::Client::new();
-                    match client.get(&url).send().await {
-                        Ok(response)
-                            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
-                                && !response.status().is_server_error() => Ok(response),
-                        Ok(response) => {
-                            crate::daemon_log!(
-                                "[Sync] Retrying HTTP source for '{}' after status {}",
+            let opened_source = match transfer_source {
+                TransferSource::LocalFile(path) => {
+                    crate::daemon_log!("[Sync] Preparing '{}': opening local source", add_item.name);
+                    OpenedTransferSource::LocalFile(path)
+                }
+                TransferSource::HttpUrl(url) => {
+                    crate::daemon_log!("[Sync] Preparing '{}': opening HTTP stream", add_item.name);
+                    let response_result = tokio::select! {
+                        result = async {
+                            let client = reqwest::Client::new();
+                            match client.get(&url).send().await {
+                                Ok(response)
+                                    if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+                                        && !response.status().is_server_error() => Ok(response),
+                                Ok(response) => {
+                                    crate::daemon_log!(
+                                        "[Sync] Retrying HTTP source for '{}' after status {}",
+                                        add_item.name,
+                                        response.status()
+                                    );
+                                    client.get(&url).send().await
+                                }
+                                Err(first_error) => {
+                                    crate::daemon_log!("[Sync] Retrying HTTP source for '{}': {}", add_item.name, first_error);
+                                    client.get(&url).send().await
+                                }
+                            }
+                        } => result,
+                        _ = wait_for_operation_cancellation(&producer_operation_manager, &producer_operation_id) => break,
+                    };
+                    let response = match response_result {
+                        Ok(response) => response,
+                        Err(e) => {
+                            if add_item.is_auto_fill {
+                                warnings.push(format!("[Sync] Auto-Fill source failed for '{}': {}", add_item.name, e));
+                                mark_operation_item_handled(&producer_operation_manager, &producer_operation_id, add_item.size_bytes).await;
+                                continue;
+                            }
+                            errors.push(SyncFileError {
+                                jellyfin_id: add_item.jellyfin_id.clone(),
+                                filename: add_item.name.clone(),
+                                error_message: format!("Failed to open stream: {}", e),
+                            });
+                            let _ = producer_operation_manager.request_cancel(&producer_operation_id).await;
+                            break;
+                        }
+                    };
+                    if !response.status().is_success() {
+                        if profile.is_some() {
+                            warnings.push(format!(
+                                "[Sync] Skipped '{}' ({}) because required transcoding returned status {}",
                                 add_item.name,
+                                add_item.jellyfin_id,
                                 response.status()
-                            );
-                            client.get(&url).send().await
+                            ));
+                            mark_operation_item_handled(
+                                &producer_operation_manager,
+                                &producer_operation_id,
+                                add_item.size_bytes,
+                            )
+                            .await;
+                        } else {
+                            let error_message = format!("Stream returned status {}", response.status());
+                            if add_item.is_auto_fill {
+                                warnings.push(format!("[Sync] Auto-Fill source failed for '{}': {}", add_item.name, error_message));
+                                mark_operation_item_handled(&producer_operation_manager, &producer_operation_id, add_item.size_bytes).await;
+                            } else {
+                                errors.push(SyncFileError {
+                                    jellyfin_id: add_item.jellyfin_id.clone(),
+                                    filename: add_item.name.clone(),
+                                    error_message,
+                                });
+                                let _ = producer_operation_manager.request_cancel(&producer_operation_id).await;
+                                break;
+                            }
                         }
-                        Err(first_error) => {
-                            crate::daemon_log!("[Sync] Retrying HTTP source for '{}': {}", add_item.name, first_error);
-                            client.get(&url).send().await
-                        }
-                    }
-                } => result,
-                _ = wait_for_operation_cancellation(&producer_operation_manager, &producer_operation_id) => break,
-            };
-            let response = match response_result {
-                Ok(response) => response,
-                Err(e) => {
-                    if add_item.is_auto_fill {
-                        warnings.push(format!("[Sync] Auto-Fill source failed for '{}': {}", add_item.name, e));
-                        mark_operation_item_handled(&producer_operation_manager, &producer_operation_id, add_item.size_bytes).await;
                         continue;
                     }
-                    errors.push(SyncFileError {
-                        jellyfin_id: add_item.jellyfin_id.clone(),
-                        filename: add_item.name.clone(),
-                        error_message: format!("Failed to open stream: {}", e),
-                    });
-                    let _ = producer_operation_manager.request_cancel(&producer_operation_id).await;
-                    break;
+                    OpenedTransferSource::Http { url, response }
                 }
             };
-            if !response.status().is_success() {
-                if profile.is_some() {
-                    warnings.push(format!(
-                        "[Sync] Skipped '{}' ({}) because required transcoding returned status {}",
-                        add_item.name,
-                        add_item.jellyfin_id,
-                        response.status()
-                    ));
-                    mark_operation_item_handled(
-                        &producer_operation_manager,
-                        &producer_operation_id,
-                        add_item.size_bytes,
-                    )
-                    .await;
-                } else {
-                    let error_message = format!("Stream returned status {}", response.status());
-                    if add_item.is_auto_fill {
-                        warnings.push(format!("[Sync] Auto-Fill source failed for '{}': {}", add_item.name, error_message));
-                        mark_operation_item_handled(&producer_operation_manager, &producer_operation_id, add_item.size_bytes).await;
-                    } else {
-                        errors.push(SyncFileError {
-                            jellyfin_id: add_item.jellyfin_id.clone(),
-                            filename: add_item.name.clone(),
-                            error_message,
-                        });
-                        let _ = producer_operation_manager.request_cancel(&producer_operation_id).await;
-                        break;
-                    }
-                }
-                continue;
-            }
 
-            let response_content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok());
-            let response_format = provider_audio_format(None, response_content_type);
+            let response_content_type = match &opened_source {
+                OpenedTransferSource::Http { response, .. } => response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                OpenedTransferSource::LocalFile(_) => None,
+            };
+            let response_format =
+                provider_audio_format(None, response_content_type.as_deref());
             let extension_override = if !producer_compatibility.is_constrained() {
                 source_format
                     .extension
@@ -2711,7 +2733,7 @@ pub async fn execute_provider_sync(
                     } else {
                         format!(
                             "the provider returned incompatible content type {:?}",
-                            response_content_type.unwrap_or("unknown")
+                            response_content_type.as_deref().unwrap_or("unknown")
                         )
                     };
                     warnings.push(format!(
@@ -2728,7 +2750,7 @@ pub async fn execute_provider_sync(
                 }
             } else {
                 let has_unrecognized_specific_content_type =
-                    response_content_type.is_some_and(|content_type| {
+                    response_content_type.as_deref().is_some_and(|content_type| {
                         response_format.is_empty() && !is_generic_binary_content_type(content_type)
                     });
                 if (!response_format.is_empty()
@@ -2739,7 +2761,7 @@ pub async fn execute_provider_sync(
                         "[Sync] Skipped '{}' ({}) because the provider returned incompatible content type {:?}",
                         add_item.name,
                         add_item.jellyfin_id,
-                        response_content_type.unwrap_or("unknown")
+                        response_content_type.as_deref().unwrap_or("unknown")
                     ));
                     mark_operation_item_handled(
                         &producer_operation_manager,
@@ -2877,63 +2899,101 @@ pub async fn execute_provider_sync(
                 "{index:06}-{}",
                 provider_sync_staging_path_component(&add_item.jellyfin_id)
             ));
-            let mut response = response;
-            let staged_size_result = loop {
-                let result = stream_to_staging_file(
-                    response.bytes_stream(),
-                    total_size,
-                    Arc::clone(&progress_callback),
-                    &staged_path,
-                    &producer_operation_manager,
-                    &producer_operation_id,
-                    &mut byte_permit,
-                )
-                .await;
-                if result.is_ok()
-                    || producer_operation_manager
-                        .is_cancelled(&producer_operation_id)
-                        .await
-                {
-                    break result;
-                }
+            let staged_size_result = match opened_source {
+                OpenedTransferSource::Http { url, mut response } => loop {
+                    let result = stream_to_staging_file(
+                        response.bytes_stream(),
+                        total_size,
+                        Arc::clone(&progress_callback),
+                        &staged_path,
+                        &producer_operation_manager,
+                        &producer_operation_id,
+                        &mut byte_permit,
+                    )
+                    .await;
+                    if result.is_ok()
+                        || producer_operation_manager
+                            .is_cancelled(&producer_operation_id)
+                            .await
+                    {
+                        break result;
+                    }
 
-                let first_error = result.unwrap_err();
-                crate::daemon_log!(
-                    "[Sync] Retrying staged source for '{}': {}",
-                    add_item.name,
-                    first_error
-                );
-                let _ = tokio::fs::remove_file(&staged_path).await;
-                let retry_response = tokio::select! {
-                    result = reqwest::Client::new().get(&url).send() => result,
-                    _ = wait_for_operation_cancellation(&producer_operation_manager, &producer_operation_id) => {
-                        break Err(anyhow::anyhow!("Cancelled while retrying staged source"));
-                    },
-                };
-                match retry_response {
-                    Ok(retry) if retry.status().is_success() => {
-                        response = retry;
-                        break stream_to_staging_file(
-                            response.bytes_stream(),
+                    let first_error = result.unwrap_err();
+                    crate::daemon_log!(
+                        "[Sync] Retrying staged source for '{}': {}",
+                        add_item.name,
+                        first_error
+                    );
+                    let _ = tokio::fs::remove_file(&staged_path).await;
+                    let retry_response = tokio::select! {
+                        result = reqwest::Client::new().get(&url).send() => result,
+                        _ = wait_for_operation_cancellation(&producer_operation_manager, &producer_operation_id) => {
+                            break Err(anyhow::anyhow!("Cancelled while retrying staged source"));
+                        },
+                    };
+                    match retry_response {
+                        Ok(retry) if retry.status().is_success() => {
+                            response = retry;
+                            break stream_to_staging_file(
+                                response.bytes_stream(),
+                                total_size,
+                                Arc::clone(&progress_callback),
+                                &staged_path,
+                                &producer_operation_manager,
+                                &producer_operation_id,
+                                &mut byte_permit,
+                            )
+                            .await;
+                        }
+                        Ok(retry) => break Err(anyhow::anyhow!(
+                            "Source retry returned status {} after: {}",
+                            retry.status(),
+                            first_error
+                        )),
+                        Err(retry_error) => break Err(anyhow::anyhow!(
+                            "Source retry failed after {}: {}",
+                            first_error,
+                            retry_error
+                        )),
+                    }
+                },
+                OpenedTransferSource::LocalFile(path) => {
+                    let result = local_file_to_staging_file(
+                        &path,
+                        total_size,
+                        Arc::clone(&progress_callback),
+                        &staged_path,
+                        &producer_operation_manager,
+                        &producer_operation_id,
+                        &mut byte_permit,
+                    )
+                    .await;
+                    if result.is_ok()
+                        || producer_operation_manager
+                            .is_cancelled(&producer_operation_id)
+                            .await
+                    {
+                        result
+                    } else {
+                        let first_error = result.unwrap_err();
+                        crate::daemon_log!(
+                            "[Sync] Retrying local staged source for '{}': {}",
+                            add_item.name,
+                            first_error
+                        );
+                        let _ = tokio::fs::remove_file(&staged_path).await;
+                        local_file_to_staging_file(
+                            &path,
                             total_size,
-                            progress_callback,
+                            Arc::clone(&progress_callback),
                             &staged_path,
                             &producer_operation_manager,
                             &producer_operation_id,
                             &mut byte_permit,
                         )
-                        .await;
+                        .await
                     }
-                    Ok(retry) => break Err(anyhow::anyhow!(
-                        "Source retry returned status {} after: {}",
-                        retry.status(),
-                        first_error
-                    )),
-                    Err(retry_error) => break Err(anyhow::anyhow!(
-                        "Source retry failed after {}: {}",
-                        first_error,
-                        retry_error
-                    )),
                 }
             };
             let staged_size = match staged_size_result {
@@ -3631,6 +3691,136 @@ where
     file.flush()
         .await
         .with_context(|| format!("Failed to flush staging file {}", path.display()))?;
+    Ok(bytes_written)
+}
+
+fn open_verified_local_source(path: &Path, expected_size: u64) -> Result<std::fs::File> {
+    let before = std::fs::symlink_metadata(path)
+        .context("Failed to inspect the local source before opening")?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(anyhow::anyhow!("Local source is no longer a regular file"));
+    }
+    if before.len() != expected_size {
+        return Err(anyhow::anyhow!(
+            "Local source changed size after the library was indexed"
+        ));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .context("Failed to validate the local source before opening")?;
+    if canonical != path {
+        return Err(anyhow::anyhow!(
+            "Local source path changed after the library was indexed"
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .context("Failed to open the validated local source")?;
+    let opened = file
+        .metadata()
+        .context("Failed to verify the opened local source")?;
+    if !opened.is_file() || opened.len() != expected_size {
+        return Err(anyhow::anyhow!(
+            "Local source changed while it was being opened"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err(anyhow::anyhow!(
+                "Local source changed while it was being opened"
+            ));
+        }
+    }
+    Ok(file)
+}
+
+async fn local_file_to_staging_file(
+    source_path: &Path,
+    total_size: u64,
+    on_progress: ProgressCallback,
+    staging_path: &Path,
+    operation_manager: &SyncOperationManager,
+    operation_id: &str,
+    byte_permit: &mut StagedBytePermit,
+) -> Result<u64> {
+    if total_size > MAX_FILE_BUFFER_BYTES {
+        return Err(anyhow::anyhow!(
+            "File too large to stage ({} bytes > {} byte limit)",
+            total_size,
+            MAX_FILE_BUFFER_BYTES
+        ));
+    }
+
+    let source = open_verified_local_source(source_path, total_size)?;
+    let initial_metadata = source
+        .metadata()
+        .context("Failed to inspect the opened local source")?;
+    let initial_modified = initial_metadata.modified().ok();
+    let mut source = tokio::fs::File::from_std(source);
+    let mut destination = tokio::fs::File::create(staging_path)
+        .await
+        .with_context(|| format!("Failed to create staging file {}", staging_path.display()))?;
+    let mut buffer = vec![0u8; 128 * 1024];
+    let mut bytes_written = 0u64;
+
+    loop {
+        let bytes_read = tokio::select! {
+            result = source.read(&mut buffer) => {
+                result.context("Failed to read the local source")?
+            }
+            _ = wait_for_operation_cancellation(operation_manager, operation_id) => {
+                return Err(anyhow::anyhow!("Cancelled while staging local source"));
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        let next_size = bytes_written.saturating_add(bytes_read as u64);
+        if next_size > total_size || next_size > MAX_FILE_BUFFER_BYTES {
+            return Err(anyhow::anyhow!(
+                "Local source changed size while it was being staged"
+            ));
+        }
+        byte_permit
+            .reserve_to(next_size, operation_manager, operation_id)
+            .await?;
+        destination
+            .write_all(&buffer[..bytes_read])
+            .await
+            .with_context(|| format!("Failed to write staging file {}", staging_path.display()))?;
+        bytes_written = next_size;
+        on_progress(bytes_written, total_size);
+    }
+
+    destination
+        .flush()
+        .await
+        .with_context(|| format!("Failed to flush staging file {}", staging_path.display()))?;
+    if bytes_written != total_size {
+        return Err(anyhow::anyhow!(
+            "Local source changed size while it was being staged"
+        ));
+    }
+    let final_metadata = source
+        .metadata()
+        .await
+        .context("Failed to revalidate the staged local source")?;
+    if final_metadata.len() != initial_metadata.len()
+        || (initial_modified.is_some() && final_metadata.modified().ok() != initial_modified)
+    {
+        return Err(anyhow::anyhow!(
+            "Local source changed while it was being staged"
+        ));
+    }
     Ok(bytes_written)
 }
 

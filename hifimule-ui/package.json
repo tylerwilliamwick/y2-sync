@@ -12,6 +12,7 @@
   "dependencies": {
     "@shoelace-style/shoelace": "^2.19.1",
     "@tauri-apps/api": "~2.10",
+    "@tauri-apps/plugin-dialog": "2.6.0",
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {

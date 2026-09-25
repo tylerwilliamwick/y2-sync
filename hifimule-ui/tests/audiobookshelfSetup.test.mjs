@@ -12,7 +12,15 @@ const helpers = await import(`data:text/javascript;base64,${Buffer.from(helperJs
 test('provider choices include explicit and automatic Audiobookshelf paths', () => {
     assert.equal(helpers.isLoginProviderChoice('auto'), true);
     assert.equal(helpers.isLoginProviderChoice('audiobookshelf'), true);
+    assert.equal(helpers.isLoginProviderChoice('localFolder'), true);
     assert.equal(helpers.isLoginProviderChoice('guessed-audiobookshelf'), false);
+});
+
+test('local folder flow uses the native directory picker and dedicated RPC', async () => {
+    const loginSource = await readFile(new URL('../src/login.ts', import.meta.url), 'utf8');
+    assert.match(loginSource, /open\(\{[\s\S]*directory: true/);
+    assert.match(loginSource, /selectedProvider === 'localFolder'[\s\S]*localLibraryAdd/);
+    assert.doesNotMatch(loginSource, /localLibraryAdd\(\{[^}]*password/);
 });
 
 test('auto submit re-probes and routes Audiobookshelf into discovery', async () => {

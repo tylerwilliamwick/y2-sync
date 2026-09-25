@@ -151,6 +151,158 @@ export interface AudiobookshelfSetup {
     libraries: AudiobookshelfLibraryChoice[];
 }
 
+export interface LocalLibraryAddResult {
+    ok: true;
+    serverId: string;
+    localId: string;
+    serverType: 'localFolder';
+    serverVersion: 'local-v1';
+    songCount: number;
+}
+
+export async function localLibraryAdd(params: {
+    path: string;
+    name?: string;
+    icon?: string;
+}): Promise<LocalLibraryAddResult> {
+    return await rpcCall('library.local.add', params) as LocalLibraryAddResult;
+}
+
+export interface LocalMetadataTrack {
+    songId: string;
+    relativePath: string;
+    version: string;
+    title: string;
+    artist: string;
+    album: string;
+    genre: string | null;
+    year: number | null;
+    trackNumber: number | null;
+    discNumber: number | null;
+    durationSeconds: number;
+    recordingMbid: string | null;
+    hasEmbeddedArtwork: boolean;
+    issues: string[];
+}
+
+export interface LocalMetadataAudit {
+    totalTracks: number;
+    tracksWithIssues: number;
+    issueCounts: Record<string, number>;
+    offset: number;
+    limit: number;
+    tracks: LocalMetadataTrack[];
+}
+
+export interface MetadataCandidate {
+    candidateId: string;
+    score: number;
+    recordingMbid: string;
+    title: string;
+    artist: string;
+    artistMbid: string | null;
+    album: string;
+    releaseMbid: string | null;
+    releaseGroupMbid: string | null;
+    year: number | null;
+    trackNumber: number | null;
+    discNumber: number | null;
+    genre: string | null;
+    durationMs: number | null;
+    coverArtUrl: string | null;
+}
+
+export interface MetadataPatch {
+    title: string;
+    artist: string;
+    album: string;
+    genre: string | null;
+    year: number | null;
+    trackNumber: number | null;
+    discNumber: number | null;
+    recordingMbid: string;
+    artistMbid: string | null;
+    releaseMbid: string | null;
+    releaseGroupMbid: string | null;
+    includeArtwork: boolean;
+}
+
+export interface PlaylistToolResult {
+    title: string;
+    trackCount: number;
+    playlistRelativePath: string | null;
+    backupRelativePath: string | null;
+    tracks: Array<{ songId: string; title: string; artist: string; album: string; relativePath: string }>;
+}
+
+export interface ListenBrainzImportResult {
+    title: string;
+    sourceKind: string;
+    sourcePlaylistId: string;
+    sourceDate: string;
+    recommendationCount: number;
+    matchedCount: number;
+    unavailableCount: number;
+    ambiguousCount: number;
+    duplicateCount: number;
+    playlistRelativePath: string | null;
+    backupRelativePath: string | null;
+    matched: Array<{
+        recommendation: { title: string; artist: string; album: string; recordingMbid: string | null };
+        songId: string;
+        relativePath: string;
+        matchMethod: 'musicBrainzId' | 'artistTitle';
+    }>;
+    unavailable: Array<{ title: string; artist: string; album: string; recordingMbid: string | null }>;
+    ambiguous: Array<{ title: string; artist: string; album: string; recordingMbid: string | null }>;
+}
+
+export async function localMetadataAudit(): Promise<LocalMetadataAudit> {
+    return await rpcCall('library.local.metadata.audit', {
+        offset: 0,
+        limit: 500,
+        issuesOnly: true,
+    }) as LocalMetadataAudit;
+}
+
+export async function localMetadataLookup(track: LocalMetadataTrack): Promise<{
+    track: LocalMetadataTrack;
+    candidates: MetadataCandidate[];
+}> {
+    return await rpcCall('library.local.metadata.lookup', {
+        songId: track.songId,
+        expectedVersion: track.version,
+    });
+}
+
+export async function localMetadataApply(track: LocalMetadataTrack, patch: MetadataPatch): Promise<{
+    track: LocalMetadataTrack;
+    backupRelativePath: string;
+    artworkWritten: boolean;
+}> {
+    return await rpcCall('library.local.metadata.apply', {
+        songId: track.songId,
+        expectedVersion: track.version,
+        patch,
+    });
+}
+
+export async function localPlaylistGenerate(params: {
+    kind: 'discovery' | 'weekly' | 'daily';
+    maxTracks: number;
+    write: boolean;
+}): Promise<PlaylistToolResult> {
+    return await rpcCall('library.local.playlist.generate', params) as PlaylistToolResult;
+}
+
+export async function localListenBrainzImport(params: {
+    username: string;
+    kind: 'weekly-exploration' | 'weekly-jams' | 'daily-jams';
+    write: boolean;
+}): Promise<ListenBrainzImportResult> {
+    return await rpcCall('library.local.listenbrainz.import', params) as ListenBrainzImportResult;
+}
+
 export async function audiobookshelfDiscover(params: {
     url: string;
     username: string;

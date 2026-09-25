@@ -138,6 +138,7 @@ pub fn server_type_label(server_type: &str) -> &'static str {
         "openSubsonic" => "OpenSubsonic",
         "subsonic" => "Subsonic",
         "audiobookshelf" => "Audiobookshelf",
+        "localFolder" => "Local Music",
         _ => "Server",
     }
 }
@@ -147,6 +148,7 @@ pub fn default_server_icon(server_type: &str) -> &'static str {
         "jellyfin" => "collection-play",
         "openSubsonic" | "subsonic" => "music-note-list",
         "audiobookshelf" => "book",
+        "localFolder" => "folder-music",
         _ => "hdd-network",
     }
 }
@@ -614,18 +616,35 @@ impl Database {
             .map_err(|e| anyhow!("Failed to calculate timestamp: {}", e))?
             .as_secs() as i64;
 
-        // Match an existing server by normalized URL (trim trailing slash, lowercase).
-        let normalized = normalized_server_url(url);
+        // File URLs are case-sensitive on some supported filesystems. Preserve
+        // their canonical case for identity and matching; network server URLs
+        // retain the historical case-insensitive normalization.
+        let is_local_folder = server_type == "localFolder";
+        let normalized = if is_local_folder {
+            url.trim().trim_end_matches('/').to_string()
+        } else {
+            normalized_server_url(url)
+        };
         let reported_id = server_reported_id.map(str::trim).filter(|s| !s.is_empty());
-        let existing_id: Option<String> = conn
-            .query_row(
+        let existing_id: Option<String> = if is_local_folder {
+            conn.query_row(
                 "SELECT id FROM server_config
-                 WHERE lower(rtrim(trim(url), '/')) = ?1
-                   AND server_type != 'audiobookshelf'",
+                 WHERE rtrim(trim(url), '/') = ?1
+                   AND server_type = 'localFolder'",
                 params![normalized],
                 |row| row.get(0),
             )
-            .ok();
+            .ok()
+        } else {
+            conn.query_row(
+                "SELECT id FROM server_config
+                 WHERE lower(rtrim(trim(url), '/')) = ?1
+                   AND server_type NOT IN ('audiobookshelf', 'localFolder')",
+                params![normalized],
+                |row| row.get(0),
+            )
+            .ok()
+        };
 
         if let Some(id) = existing_id {
             // Story 2.13: `server_id` is FROZEN once persisted. Backfill or the

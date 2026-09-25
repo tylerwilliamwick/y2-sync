@@ -12,6 +12,7 @@ use thiserror::Error;
 
 pub mod audiobookshelf;
 pub mod jellyfin;
+pub mod local;
 pub mod subsonic;
 
 pub const SUBSONIC_PLAYLISTS_LIBRARY_ID: &str = "playlists";
@@ -411,6 +412,20 @@ pub trait MediaProvider: Send + Sync {
         profile: Option<&TranscodeProfile>,
     ) -> Result<String, ProviderError>;
 
+    /// Resolves a source for device transfer without forcing local files through
+    /// an HTTP URL. Network providers inherit the existing URL behavior; local
+    /// providers return a canonical path that the sync engine validates again
+    /// immediately before opening.
+    async fn transfer_source(
+        &self,
+        song_id: &str,
+        profile: Option<&TranscodeProfile>,
+    ) -> Result<TransferSource, ProviderError> {
+        self.download_url(song_id, profile)
+            .await
+            .map(TransferSource::HttpUrl)
+    }
+
     async fn resolve_playback(&self, _song_id: &str) -> Result<PlaybackDescription, ProviderError> {
         Err(ProviderError::UnsupportedCapability(
             "resolve_playback is not supported by this provider".to_string(),
@@ -649,6 +664,7 @@ pub enum ServerType {
     Subsonic,
     OpenSubsonic,
     Audiobookshelf,
+    LocalFolder,
     Unknown,
 }
 
@@ -723,6 +739,21 @@ pub struct TranscodeProfile {
     pub container: Option<String>,
     pub audio_codec: Option<String>,
     pub max_bitrate_kbps: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum TransferSource {
+    HttpUrl(String),
+    LocalFile(std::path::PathBuf),
+}
+
+impl fmt::Debug for TransferSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpUrl(_) => formatter.write_str("HttpUrl([redacted])"),
+            Self::LocalFile(_) => formatter.write_str("LocalFile([redacted])"),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -909,6 +940,7 @@ pub fn server_type_slug(server_type: ServerType) -> Option<&'static str> {
         ServerType::Subsonic => Some("subsonic"),
         ServerType::OpenSubsonic => Some("openSubsonic"),
         ServerType::Audiobookshelf => Some("audiobookshelf"),
+        ServerType::LocalFolder => Some("localFolder"),
         ServerType::Unknown => None,
     }
 }

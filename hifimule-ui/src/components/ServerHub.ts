@@ -77,6 +77,12 @@ export class ServerHub {
                     <sl-menu>
                         ${rows || `<sl-menu-item disabled>${t('serverHub.empty')}</sl-menu-item>`}
                         <sl-divider></sl-divider>
+                        ${selected?.serverType === 'localFolder' ? `
+                            <sl-menu-item class="server-hub-library-tools">
+                                <sl-icon slot="prefix" name="magic"></sl-icon>
+                                ${t('libraryTools.open')}
+                            </sl-menu-item>
+                        ` : ''}
                         <sl-menu-item class="server-hub-add">
                             <sl-icon slot="prefix" name="plus-lg"></sl-icon>
                             ${t('serverHub.add')}
@@ -117,6 +123,10 @@ export class ServerHub {
             });
         });
         this.container.querySelector('.server-hub-add')?.addEventListener('click', () => this.handleAdd());
+        this.container.querySelector('.server-hub-library-tools')?.addEventListener('click', async () => {
+            const { LibraryToolsDialog } = await import('./LibraryToolsDialog');
+            await new LibraryToolsDialog().open();
+        });
         this.container.querySelector('.server-hub-logout')?.addEventListener('click', () => this.handleLogout());
     }
 

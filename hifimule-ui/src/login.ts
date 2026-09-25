@@ -2,10 +2,12 @@ import {
     audiobookshelfCancelSetup,
     audiobookshelfCommit,
     audiobookshelfDiscover,
+    localLibraryAdd,
     rpcCall,
     serverReauthenticate,
     type AudiobookshelfSetup,
 } from './rpc';
+import { open } from '@tauri-apps/plugin-dialog';
 import { t } from './i18n';
 import { SERVER_ICON_OPTIONS, defaultServerIcon, serverTypeLabel } from './serverIdentity';
 import {
@@ -23,6 +25,7 @@ function serverTypeBadge(type: string | null): BadgeSpec | null {
         case 'openSubsonic': return { label: serverTypeLabel(type), variant: 'success' };
         case 'subsonic':     return { label: serverTypeLabel(type), variant: 'neutral' };
         case 'audiobookshelf': return { label: 'Audiobookshelf', variant: 'warning' };
+        case 'localFolder': return { label: serverTypeLabel(type), variant: 'primary' };
         default:             return null;
     }
 }
@@ -86,18 +89,32 @@ function loginFormHtml(options: LoginViewOptions, showIdentity = true): string {
                 <sl-option value="jellyfin">Jellyfin</sl-option>
                 <sl-option value="subsonic">Subsonic / OpenSubsonic</sl-option>
                 <sl-option value="audiobookshelf">Audiobookshelf</sl-option>
+                <sl-option value="localFolder">${t('server.local_folder')}</sl-option>
             </sl-select>
             <br>` : ''}
             ${!scopedReauth ? `
-            <div style="position: relative;">
-                <sl-input name="url" label="${t('login.server_url')}" placeholder="${t('login.server_url_placeholder')}" ${urlAttrs} required></sl-input>
-                <div id="server-type-indicator" style="min-height: 1.5rem; margin-top: 0.4rem;"></div>
+            <div id="remote-source-fields">
+                <div style="position: relative;">
+                    <sl-input name="url" label="${t('login.server_url')}" placeholder="${t('login.server_url_placeholder')}" ${urlAttrs} required></sl-input>
+                    <div id="server-type-indicator" style="min-height: 1.5rem; margin-top: 0.4rem;"></div>
+                </div>
+                <br>
+                <sl-input name="username" label="${t('login.username')}" value="${escapeHtml(options.prefillUsername ?? '')}" required></sl-input>
+                <br>
+                <sl-input name="password" type="password" label="${t('login.password')}" required password-toggle></sl-input>
+                <br>
             </div>
-            <br>
-            <sl-input name="username" label="${t('login.username')}" value="${escapeHtml(options.prefillUsername ?? '')}" required></sl-input>
-            <br>` : `<p>${t('login.audiobookshelf.reauth_password_only')}</p>`}
+            <div id="local-source-fields" hidden>
+                <p>${t('login.local_folder_hint')}</p>
+                <div style="display:flex;gap:.5rem;align-items:end">
+                    <sl-input name="localFolder" label="${t('login.local_folder')}" readonly style="flex:1"></sl-input>
+                    <sl-button id="choose-local-folder" type="button">${t('login.choose_folder')}</sl-button>
+                </div>
+                <br>
+            </div>` : `
+            <p>${t('login.audiobookshelf.reauth_password_only')}</p>
             <sl-input name="password" type="password" label="${t('login.password')}" required password-toggle></sl-input>
-            <br>
+            <br>`}
             ${identityFields}
 
             <div id="login-error" class="error-text" style="display: none; color: var(--sl-color-danger-500); margin-bottom: 1rem;"></div>
@@ -165,8 +182,14 @@ function bindLoginForm(
 ) {
     const form = root.querySelector('#login-form') as HTMLFormElement;
     const indicator = root.querySelector('#server-type-indicator') as HTMLElement | null;
-    const urlInput = form.querySelector('sl-input[name="url"]') as (HTMLElement & { value: string }) | null;
+    const urlInput = form.querySelector('sl-input[name="url"]') as (HTMLElement & { value: string; required: boolean }) | null;
     const providerSelect = form.querySelector('sl-select[name="serverType"]') as (HTMLElement & { value: string }) | null;
+    const remoteFields = form.querySelector('#remote-source-fields') as HTMLElement | null;
+    const localFields = form.querySelector('#local-source-fields') as HTMLElement | null;
+    const usernameInput = form.querySelector('sl-input[name="username"]') as (HTMLElement & { required: boolean }) | null;
+    const passwordInput = form.querySelector('sl-input[name="password"]') as (HTMLElement & { required: boolean }) | null;
+    const localFolderInput = form.querySelector('sl-input[name="localFolder"]') as (HTMLElement & { value: string }) | null;
+    const chooseLocalFolder = form.querySelector('#choose-local-folder') as HTMLElement | null;
     const nameInput = form.querySelector('sl-input[name="serverName"]') as (HTMLElement & { value: string }) | null;
     const identityEnabled = mode !== 'reauth' && Boolean(nameInput);
 
@@ -175,6 +198,7 @@ function bindLoginForm(
     let lastDefaultName = '';
     let nameEdited = false;
     let iconEdited = false;
+    let localFolderPath = '';
 
     const setSelectedIcon = (icon: string) => {
         selectedIcon = icon;
@@ -211,11 +235,33 @@ function bindLoginForm(
     };
 
     let probeGeneration = 0;
+    const applyProviderFields = (provider: string) => {
+        const local = provider === 'localFolder';
+        if (remoteFields) remoteFields.hidden = local;
+        if (localFields) localFields.hidden = !local;
+        if (urlInput) urlInput.required = !local;
+        if (usernameInput) usernameInput.required = !local;
+        if (passwordInput) passwordInput.required = !local;
+    };
+
+    chooseLocalFolder?.addEventListener('click', async () => {
+        const selected = await open({
+            directory: true,
+            multiple: false,
+            title: t('login.choose_folder'),
+        });
+        const path = typeof selected === 'string' ? selected : null;
+        if (!path) return;
+        localFolderPath = path;
+        if (localFolderInput) localFolderInput.value = path;
+    });
+
     providerSelect?.addEventListener('sl-change', () => {
         probeGeneration += 1;
         if (probeTimer) clearTimeout(probeTimer);
         const provider = providerSelect.value;
         if (!isLoginProviderChoice(provider)) return;
+        applyProviderFields(provider);
         if (indicator) {
             const badge = serverTypeBadge(provider === 'auto' ? null : provider);
             indicator.innerHTML = badge
@@ -224,6 +270,7 @@ function bindLoginForm(
         }
         applyIdentityDefaults(provider === 'auto' ? 'unknown' : provider);
     });
+    applyProviderFields(providerSelect?.value ?? 'auto');
 
     urlInput?.addEventListener('sl-input', () => {
         probeGeneration += 1;
@@ -262,7 +309,7 @@ function bindLoginForm(
         const password = formData.get('password') as string;
         const name = nameInput?.value?.trim();
 
-        const btn = form.querySelector('sl-button') as HTMLElement & { loading: boolean };
+        const btn = form.querySelector('sl-button[type="submit"]') as HTMLElement & { loading: boolean };
         const errorEl = root.querySelector('#login-error') as HTMLElement | null;
 
         if (btn) btn.loading = true;
@@ -279,6 +326,19 @@ function bindLoginForm(
             const selectedProvider = providerSelect?.value ?? 'auto';
             if (!isLoginProviderChoice(selectedProvider)) {
                 throw new Error(t('login.provider_required'));
+            }
+            if (selectedProvider === 'localFolder') {
+                if (!localFolderPath) throw new Error(t('login.local_folder_required'));
+                const payload: { path: string; name?: string; icon?: string } = {
+                    path: localFolderPath,
+                };
+                if (identityEnabled && name) {
+                    payload.name = name;
+                    payload.icon = selectedIcon;
+                }
+                await localLibraryAdd(payload);
+                onLoginSuccess();
+                return;
             }
             const detectedProvider = selectedProvider === 'auto'
                 ? (await rpcCall('server.probe', { url }))?.serverType ?? null
