@@ -140,6 +140,8 @@ export function sanitizedEnvironment(environment = process.env, options = {}) {
     "CARGO_NET_OFFLINE",
     "CARGO_TERM_COLOR",
     "npm_config_cache",
+    "npm_config_globalconfig",
+    "npm_config_userconfig",
     "XDG_CACHE_HOME",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -820,7 +822,7 @@ export function sandboxPermissionOverride({
   return `permissions.${profileName}={extends=${tomlString(baseProfile)},filesystem={${entries}},network={enabled=${networkEnabled ? "true" : "false"}${localBinding}}}`;
 }
 
-function gateEnvironment(configuration) {
+export function gateEnvironment(configuration) {
   const scratchDir = mkdtempSync(join("/tmp", "y2m-"));
   const toolCacheDir = join(configuration.cacheDir, "tooling");
   const home = join(scratchDir, "home");
@@ -829,6 +831,8 @@ function gateEnvironment(configuration) {
   const codexHome = join(scratchDir, "codex-home");
   const cargoHome = join(toolCacheDir, "cargo");
   const npmCache = join(toolCacheDir, "npm");
+  const npmGlobalConfig = join(scratchDir, "npm-globalrc");
+  const npmUserConfig = join(scratchDir, "npmrc");
   for (const path of [
     home,
     temporary,
@@ -839,14 +843,21 @@ function gateEnvironment(configuration) {
   ]) {
     mkdirSync(path, { recursive: true, mode: 0o700 });
   }
+  for (const path of [npmGlobalConfig, npmUserConfig]) {
+    writeFileSync(path, "", { mode: 0o600 });
+  }
   const environment = {
     ...process.env,
     HOME: home,
     TMPDIR: `${temporary}${sep}`,
+    TMP: temporary,
+    TEMP: temporary,
     XDG_CACHE_HOME: xdgCache,
     CODEX_HOME: codexHome,
     CARGO_HOME: cargoHome,
     npm_config_cache: npmCache,
+    npm_config_globalconfig: npmGlobalConfig,
+    npm_config_userconfig: npmUserConfig,
     CI: "1",
   };
   const rustupHome = process.env.RUSTUP_HOME ?? join(homedir(), ".rustup");
@@ -868,9 +879,81 @@ export function maintenanceGatePlan(workspace) {
     { id: "rustfmt", args: ["cargo", "fmt", "--all", "--", "--check"] },
     {
       id: "ui-install",
-      args: ["npm", "ci", "--prefix", "hifimule-ui", "--ignore-scripts"],
+      args: [
+        "npm",
+        "ci",
+        "--prefix",
+        join(resolve(workspace), "hifimule-ui"),
+        "--ignore-scripts",
+      ],
       network: true,
       cacheWrite: true,
+      isolatedCwd: true,
+    },
+    {
+      id: "cargo-fetch",
+      args: [
+        "cargo",
+        "fetch",
+        "--locked",
+        "--manifest-path",
+        join(resolve(workspace), "Cargo.toml"),
+      ],
+      network: true,
+      cacheWrite: true,
+      isolatedCwd: true,
+    },
+    {
+      id: "audio-source-fetch",
+      args: [
+        "proxy",
+        "curl",
+        "--disable",
+        "--fail",
+        "--location",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "300",
+        "--max-filesize",
+        String(100 * 1024 * 1024),
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--create-dirs",
+        "--output",
+        audioSource.archivePath,
+        audioSource.sourceUrl,
+      ],
+      network: true,
+      isolatedCwd: true,
+    },
+    {
+      id: "audio-source-verify",
+      args: [
+        "proxy",
+        "node",
+        "-e",
+        verifySha256Program,
+        audioSource.archivePath,
+        audioSource.sourceSha256,
+      ],
+    },
+    {
+      id: "npm-audit",
+      args: [
+        "npm",
+        "audit",
+        "--prefix",
+        join(resolve(workspace), "hifimule-ui"),
+        "--omit=dev",
+      ],
+      network: true,
+      cacheWrite: true,
+      isolatedCwd: true,
     },
     { id: "node-tests", args: ["proxy", "node", "--test", ...nodeTests] },
     {
@@ -897,49 +980,6 @@ export function maintenanceGatePlan(workspace) {
         "proxy",
         "python3",
         "experiments/playback-probe/generate-fixtures.py",
-      ],
-    },
-    {
-      id: "cargo-fetch",
-      args: ["cargo", "fetch", "--locked"],
-      network: true,
-      cacheWrite: true,
-    },
-    {
-      id: "audio-source-fetch",
-      args: [
-        "proxy",
-        "curl",
-        "--fail",
-        "--location",
-        "--retry",
-        "3",
-        "--connect-timeout",
-        "30",
-        "--max-time",
-        "300",
-        "--max-filesize",
-        String(100 * 1024 * 1024),
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--create-dirs",
-        "--output",
-        audioSource.archivePath,
-        audioSource.sourceUrl,
-      ],
-      network: true,
-    },
-    {
-      id: "audio-source-verify",
-      args: [
-        "proxy",
-        "node",
-        "-e",
-        verifySha256Program,
-        audioSource.archivePath,
-        audioSource.sourceSha256,
       ],
     },
     {
@@ -990,21 +1030,16 @@ export function maintenanceGatePlan(workspace) {
       cargoOffline: true,
       localNetwork: true,
     },
-    {
-      id: "npm-audit",
-      args: ["npm", "audit", "--prefix", "hifimule-ui", "--omit=dev"],
-      network: true,
-      cacheWrite: true,
-    },
   ];
 }
 
 function runGates(configuration, workspace, logPath, options = {}) {
-  const { environment, scratchDir, toolCacheDir, cleanup } =
-    gateEnvironment(configuration);
   const results = [];
-  try {
-    for (const gate of maintenanceGatePlan(workspace)) {
+  for (const gate of maintenanceGatePlan(workspace)) {
+    const { environment, scratchDir, toolCacheDir, cleanup } =
+      gateEnvironment(configuration);
+    try {
+      const commandCwd = gate.isolatedCwd ? scratchDir : workspace;
       const networkMode = gate.localNetwork
         ? "local"
         : gate.network
@@ -1034,13 +1069,13 @@ function runGates(configuration, workspace, logPath, options = {}) {
           "-c",
           profile,
           "-C",
-          workspace,
+          commandCwd,
           "--",
           configuration.rtkPath,
           ...gate.args,
         ],
         {
-          cwd: workspace,
+          cwd: commandCwd,
           env: gate.cargoOffline
             ? { ...environment, CARGO_NET_OFFLINE: "true" }
             : environment,
@@ -1049,19 +1084,19 @@ function runGates(configuration, workspace, logPath, options = {}) {
       );
       results.push({ id: gate.id, ...result });
       if (result.code !== 0) break;
+    } finally {
+      cleanup();
     }
-    if (options.requireCleanTree) {
-      const integrity = git(
-        configuration,
-        workspace,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-        { logPath, check: true },
-      );
-      integrity.code = integrity.fullStdout.trim() ? 1 : 0;
-      results.push({ id: "tracked-tree-integrity", ...integrity });
-    }
-  } finally {
-    cleanup();
+  }
+  if (options.requireCleanTree) {
+    const integrity = git(
+      configuration,
+      workspace,
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      { logPath, check: true },
+    );
+    integrity.code = integrity.fullStdout.trim() ? 1 : 0;
+    results.push({ id: "tracked-tree-integrity", ...integrity });
   }
   return results;
 }

@@ -20,6 +20,7 @@ import {
   defaultCacheDir,
   discoverNodeTests,
   finalizeInterruptedReports,
+  gateEnvironment,
   isAllowedAutomatedFixPath,
   isRunnableAddedTestPath,
   maintenanceBranchName,
@@ -497,6 +498,34 @@ test("model commands receive writable isolated home, temp, and cache paths", (t)
     assert.equal(existsSync(path), true, path);
   }
 });
+test("gate commands receive fresh private configuration state", (t) => {
+  const cacheDir = mkdtempSync(join(tmpdir(), "y2-gate-cache-"));
+  const contexts = [];
+  t.after(() => {
+    for (const context of contexts) context.cleanup();
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+  contexts.push(gateEnvironment({ cacheDir }), gateEnvironment({ cacheDir }));
+  const [first, second] = contexts;
+  assert.notEqual(first.scratchDir, second.scratchDir);
+  for (const key of [
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CACHE_HOME",
+    "CODEX_HOME",
+    "npm_config_globalconfig",
+    "npm_config_userconfig",
+  ]) {
+    assert.notEqual(first.environment[key], second.environment[key], key);
+  }
+  assert.equal(existsSync(first.environment.npm_config_globalconfig), true);
+  assert.equal(existsSync(second.environment.npm_config_globalconfig), true);
+  assert.equal(existsSync(first.environment.npm_config_userconfig), true);
+  assert.equal(existsSync(second.environment.npm_config_userconfig), true);
+  assert.equal(first.toolCacheDir, second.toolCacheDir);
+});
 test("exact command output remains available without entering serialized reports", () => {
   const exact = "x".repeat(200_000);
   const record = retainExactStdout({ stdout: exact.slice(-96 * 1024) }, exact);
@@ -791,20 +820,30 @@ test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependenc
       "diff-check",
       "rustfmt",
       "ui-install",
+      "cargo-fetch",
+      "audio-source-fetch",
+      "audio-source-verify",
+      "npm-audit",
       "node-tests",
       "python-tests",
       "ui-build",
       "audio-fixtures",
-      "cargo-fetch",
-      "audio-source-fetch",
-      "audio-source-verify",
       "daemon-check",
       "local-network-probe",
       "daemon-tests",
       "support-tests",
-      "npm-audit",
     ],
   );
+  const firstRepositoryExecution = plan.findIndex(
+    (gate) => gate.id === "node-tests",
+  );
+  assert.ok(firstRepositoryExecution > 0);
+  assert.ok(
+    plan.every(
+      (gate, index) => !gate.network || index < firstRepositoryExecution,
+    ),
+  );
+  assert.ok(plan.every((gate) => !gate.network || gate.isolatedCwd === true));
   const nodeGate = plan.find((gate) => gate.id === "node-tests");
   assert.ok(
     nodeGate.args.some((value) =>
@@ -820,13 +859,25 @@ test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependenc
     plan.find((gate) => gate.id === "cargo-fetch"),
     {
       id: "cargo-fetch",
-      args: ["cargo", "fetch", "--locked"],
+      args: [
+        "cargo",
+        "fetch",
+        "--locked",
+        "--manifest-path",
+        join(root, "Cargo.toml"),
+      ],
       network: true,
       cacheWrite: true,
+      isolatedCwd: true,
     },
   );
   const audioFetch = plan.find((gate) => gate.id === "audio-source-fetch");
   assert.equal(audioFetch.network, true);
+  assert.deepEqual(audioFetch.args.slice(0, 3), [
+    "proxy",
+    "curl",
+    "--disable",
+  ]);
   assert.ok(
     audioFetch.args.includes("https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"),
   );
