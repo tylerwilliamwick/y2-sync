@@ -713,8 +713,10 @@ function canonicalExistingPath(path) {
 }
 
 function isolateHomeDirectory(filesystem, allowed) {
-  const home = canonicalExistingPath(homedir());
-  filesystem.set(home, "deny");
+  const logicalHome = resolve(homedir());
+  const canonicalHome = canonicalExistingPath(logicalHome);
+  filesystem.set(logicalHome, "deny");
+  filesystem.set(canonicalHome, "deny");
   for (const [path, access] of allowed) {
     const resolved = resolve(path);
     const canonical = canonicalExistingPath(resolved);

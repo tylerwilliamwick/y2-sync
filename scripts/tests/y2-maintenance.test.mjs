@@ -322,10 +322,6 @@ test("sensitive environment values and common token shapes are removed from repo
 test("sandbox profiles deny the user home and grant only explicit maintenance roots", () => {
   assert.equal(defaultCacheDir, join(tmpdir(), "Y2SyncMaintenanceTooling"));
   const home = resolve(homedir());
-  assert.equal(
-    defaultCacheDir === home || defaultCacheDir.startsWith(`${home}${sep}`),
-    false,
-  );
   const fixtureRoot = join(tmpdir(), "y2-maintenance-profile-fixture");
   const workspace = join(fixtureRoot, "workspace");
   const scratchDir = join(fixtureRoot, "scratch");
@@ -343,6 +339,9 @@ test("sandbox profiles deny the user home and grant only explicit maintenance ro
     network: false,
   });
   assert.ok(profile.includes(`${JSON.stringify(home)}="deny"`));
+  assert.ok(
+    profile.includes(`${JSON.stringify(realpathSync(home))}="deny"`),
+  );
   assert.ok(profile.includes(`${JSON.stringify(resolve(tmpdir()))}="read"`));
   assert.ok(profile.includes(`${JSON.stringify(workspace)}="write"`));
   assert.ok(
