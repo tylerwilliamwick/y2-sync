@@ -1012,9 +1012,10 @@ export function gateEnvironment(configuration) {
 }
 
 export function maintenanceGatePlan(workspace) {
-  const nodeTests = discoverNodeTests(workspace);
+  const workspaceRoot = canonicalExistingPath(workspace);
+  const nodeTests = discoverNodeTests(workspaceRoot);
   if (!nodeTests.length) throw new Error("no Node regression tests were found");
-  const audioSource = validatedAudioRuntimeSource(workspace);
+  const audioSource = validatedAudioRuntimeSource(workspaceRoot);
   return [
     { id: "diff-check", args: ["proxy", "git", "diff", "--check", "HEAD"] },
     { id: "rustfmt", args: ["cargo", "fmt", "--all", "--", "--check"] },
@@ -1024,7 +1025,7 @@ export function maintenanceGatePlan(workspace) {
         "npm",
         "ci",
         "--prefix",
-        join(resolve(workspace), "hifimule-ui"),
+        join(workspaceRoot, "hifimule-ui"),
         "--ignore-scripts",
         "--workspaces=false",
       ],
@@ -1039,7 +1040,7 @@ export function maintenanceGatePlan(workspace) {
         "fetch",
         "--locked",
         "--manifest-path",
-        join(resolve(workspace), "Cargo.toml"),
+        join(workspaceRoot, "Cargo.toml"),
       ],
       network: true,
       cacheWrite: true,
@@ -1090,7 +1091,7 @@ export function maintenanceGatePlan(workspace) {
         "npm",
         "audit",
         "--prefix",
-        join(resolve(workspace), "hifimule-ui"),
+        join(workspaceRoot, "hifimule-ui"),
         "--omit=dev",
       ],
       network: true,

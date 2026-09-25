@@ -868,6 +868,33 @@ test("maintenance branch names are deterministic, bounded, and revision-specific
   assert.throws(() => maintenanceBranchName("short"), /full commit ID/);
 });
 
+test(
+  "maintenance gate paths canonicalize workspace aliases",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const fixture = realpathSync(
+      mkdtempSync(join(tmpdir(), "y2-gate-workspace-alias-")),
+    );
+    t.after(() => rmSync(fixture, { recursive: true, force: true }));
+    const workspace = join(fixture, "workspace");
+    const alias = join(fixture, "workspace-alias");
+    mkdirSync(join(workspace, "scripts", "tests"), { recursive: true });
+    mkdirSync(join(workspace, "hifimule-daemon"), { recursive: true });
+    writeFileSync(join(workspace, "scripts", "tests", "probe.test.mjs"), "");
+    writeFileSync(
+      join(workspace, "hifimule-daemon", "audio-runtime.json"),
+      readFileSync(join(root, "hifimule-daemon", "audio-runtime.json")),
+    );
+    symlinkSync(workspace, alias, "dir");
+    const plan = maintenanceGatePlan(alias);
+    const uiPrefix = plan.find((gate) => gate.id === "ui-install").args[3];
+    const cargoManifest = plan.find((gate) => gate.id === "cargo-fetch")
+      .args[4];
+    assert.equal(uiPrefix, join(workspace, "hifimule-ui"));
+    assert.equal(cargoManifest, join(workspace, "Cargo.toml"));
+  },
+);
+
 test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependency audit", () => {
   const plan = maintenanceGatePlan(root);
   assert.deepEqual(
