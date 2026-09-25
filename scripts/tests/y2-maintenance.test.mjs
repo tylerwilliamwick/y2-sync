@@ -911,6 +911,11 @@ test("the fixed quality plan covers formatting, UI, scripts, Rust, and dependenc
     "python3",
     "experiments/playback-probe/generate-fixtures.py",
   ]);
+  assert.ok(
+    plan
+      .find((gate) => gate.id === "ui-install")
+      .args.includes("--workspaces=false"),
+  );
   assert.deepEqual(
     plan.find((gate) => gate.id === "cargo-fetch"),
     {

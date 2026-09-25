@@ -1026,6 +1026,7 @@ export function maintenanceGatePlan(workspace) {
         "--prefix",
         join(resolve(workspace), "hifimule-ui"),
         "--ignore-scripts",
+        "--workspaces=false",
       ],
       network: true,
       cacheWrite: true,
