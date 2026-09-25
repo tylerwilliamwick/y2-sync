@@ -2,7 +2,11 @@
   "scripts": {
     "build:ui": "npm run tauri build --prefix hifimule-ui",
     "build:daemon": "node scripts/build-daemon.mjs",
-    "build": "npm run build:ui && npm run build:daemon"
+    "build": "npm run build:ui && npm run build:daemon",
+    "maintenance:audit": "node scripts/y2-maintenance.mjs --force --audit-only",
+    "maintenance:install": "node scripts/install-y2-maintenance.mjs install",
+    "maintenance:status": "node scripts/install-y2-maintenance.mjs status",
+    "maintenance:run": "node scripts/install-y2-maintenance.mjs run --force"
   },
   "devDependencies": {
     "@eslint-community/eslint-utils": "^4.9.1",

@@ -2,6 +2,7 @@ name: Build
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
@@ -15,6 +16,9 @@ permissions:
 
 jobs:
   playback-session-evidence:
+    # Automated maintenance opens drafts. Run repository code only after a
+    # maintainer explicitly marks the pull request ready for review.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: Playback evidence (${{ matrix.label }})
     strategy:
       fail-fast: false

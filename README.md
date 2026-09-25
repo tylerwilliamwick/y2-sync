@@ -194,6 +194,8 @@ HifiMule/
 
 For a selected local folder, open **Server Hub → Library tools** to audit metadata or preview and create relative UTF-8 playlists. Metadata changes always require choosing a MusicBrainz candidate and checking the review confirmation first.
 
+Optional macOS scheduled maintenance audits committed changes in an isolated clone, reruns fixed quality gates, and can prepare a reviewed fix pull request without touching the working tree or auto-merging. See [Scheduled Y2 Sync maintenance](docs/maintenance-automation.md).
+
 ### Listening in HifiMule
 
 - Use an album’s play button to start listening on your computer. Control playback with pause/resume, previous/next, stop, and the seek bar.
